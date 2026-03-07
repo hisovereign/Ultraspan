@@ -102,6 +102,17 @@ Type in terminal: ultraspan COMMAND [arguments]
 
       ultraspan color "#3498db"
 
+#### How it works
+
+1. xrandr determines the total bounding box of all monitors
+
+2. The source image is processed with ImageMagick
+
+3. The resulting image is saved with a filename derived from the image hash, settings, and monitor dimensions.
+
+4. gsettings tells Cinnamon to use this static file with picture-options=spanned.
+  
+
 **Acknowledgments**
 
 - Monitor geometry logic detection adaptaded from [`fade-monitors`](https://github.com/hisovereign/fade-monitors) script
