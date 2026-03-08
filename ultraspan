@@ -2,7 +2,7 @@
 # ============================================
 # Combined Single-Span Multi-Monitor Wallpaper Management System
 # ============================================
-# Version 2.8 - Added random rotation feature
+# Version 2.8 -
 # ============================================
 
 set -e
@@ -148,7 +148,7 @@ set_wallpaper() {
     # Generate cache filename with all settings
     local HASH
     HASH=$(sha1sum "$image" | cut -d' ' -f1)
-    local CACHE_FILE="$CACHE_DIR/${HASH:0:12}-${mode}-${BG_TYPE}"
+    local CACHE_FILE="$CACHE_DIR/${HASH:0:12}-${TOTAL_WIDTH}x${TOTAL_HEIGHT}-${mode}-${BG_TYPE}"
     if [ "$BG_TYPE" = "blur" ]; then
         CACHE_FILE="${CACHE_FILE}-blur${BLUR_AMOUNT}.jpg"
     else
@@ -207,16 +207,20 @@ set_wallpaper() {
         "center")
             # Center image on background - SIMPLIFIED LOGIC
             echo "  Creating center mode..."
-            
+
             if [ "$BG_TYPE" = "blur" ]; then
+                # Create temporary files securely
+                blur_bg=$(mktemp) || { echo "❌ Error: Failed to create temp file"; exit 1; }
+                center_fg=$(mktemp) || { echo "❌ Error: Failed to create temp file"; exit 1; }
+
                 # Create blurred background (zoomed to fill)
                 convert "$image" \
                     -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" \
                     -gravity center \
                     -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
                     -blur "0x${BLUR_AMOUNT}" \
-                    /tmp/ultraspan_blur_bg.jpg
-                
+                    "$blur_bg"
+    
                 # Create centered image (max 80% of monitor)
                 local fit_width fit_height
                 if [ $img_width -gt $img_height ]; then
@@ -226,26 +230,26 @@ set_wallpaper() {
                     fit_height=$((TOTAL_HEIGHT * 80 / 100))
                     fit_width=$((img_width * fit_height / img_height))
                 fi
-                
+
                 [ $fit_width -gt $TOTAL_WIDTH ] && fit_width=$TOTAL_WIDTH
                 [ $fit_height -gt $TOTAL_HEIGHT ] && fit_height=$TOTAL_HEIGHT
-                
+
                 echo "  Centered image size: ${fit_width}x${fit_height}"
-                
+
                 convert "$image" \
                     -resize "${fit_width}x${fit_height}" \
-                    /tmp/ultraspan_center_fg.jpg
-                
+                    "$center_fg"
+
                 # Composite centered image on blurred background
-                convert /tmp/ultraspan_blur_bg.jpg \
-                    /tmp/ultraspan_center_fg.jpg \
+                convert "$blur_bg" \
+                    "$center_fg" \
                     -gravity center \
                     -composite \
                     -quality 95 \
                     "$CACHE_FILE"
-                
-                # Cleanup
-                rm -f /tmp/ultraspan_blur_bg.jpg /tmp/ultraspan_center_fg.jpg
+
+                # Cleanup temporary files
+                rm -f "$blur_bg" "$center_fg"
                 
             else
                 # Solid color background - SIMPLE APPROACH
