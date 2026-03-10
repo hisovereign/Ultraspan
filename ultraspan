@@ -2,7 +2,7 @@
 # ============================================
 # Combined Single-Span Multi-Monitor Wallpaper Management System
 # ============================================
-# Version 2.8 -
+# Version 2.8
 # ============================================
 
 set -e
@@ -52,7 +52,7 @@ COMMANDS:
   mode MODE                  Set default mode: zoom, fit, center
   bg-type [TYPE]            Set background type: blur, solid
   blur [0-100]              Set blur amount (default: 15)
-  color [COLOR]             Set solid color (hex: #RRGGBB)
+  color [COLOR]             Set solid color (hex: "#RRGGBB" or RRGGBB)
   random DIR [MODE]          Start random rotation from directory
   random-stop                Stop random rotation
   random-status              Show random rotation status
@@ -77,6 +77,7 @@ EXAMPLES:
   ultraspan set ~/Pictures/wallpaper.jpg
   ultraspan set ~/Pictures/landscape.jpg fit
   ultraspan random ~/Pictures/Wallpapers zoom
+  ultraspan color 000000
   ultraspan interval 10
   ultraspan status
 EOF
@@ -100,6 +101,29 @@ load_config() {
 get_default_mode() {
     load_config
     echo "${MODE:-zoom}"
+}
+
+# Update a single config key
+update_config() {
+    local key="$1"
+    local value="$2"
+    local temp_file
+    
+    mkdir -p "$CONFIG_DIR"
+    temp_file=$(mktemp)
+    
+    # If config exists, copy it, removing the target key if present
+    if [ -f "$CONFIG_FILE" ]; then
+        grep -v "^${key}=" "$CONFIG_FILE" > "$temp_file" 2>/dev/null || true
+    else
+        touch "$temp_file"
+    fi
+    
+    # Add the new key/value pair
+    echo "${key}=${value}" >> "$temp_file"
+    
+    # Move back atomically
+    mv "$temp_file" "$CONFIG_FILE"
 }
 
 # Set wallpaper with specified mode
@@ -375,7 +399,7 @@ stop_random_mode() {
         pid=$(tail -n1 "$RANDOM_FILE" 2>/dev/null)
         
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null
+            kill "$pid" 2>/dev/null || true
             echo "⏹️ Random rotation stopped"
         else
             echo "⚠️ Random rotation not running"
@@ -438,44 +462,29 @@ set_interval() {
     
     # Update config
     RANDOM_INTERVAL="$interval"
-    mkdir -p "$CONFIG_DIR"
-    
-    # Load existing config or create new
-    if [ -f "$CONFIG_FILE" ]; then
-        grep -v "^random_interval=" "$CONFIG_FILE" > /tmp/ultraspan_config.tmp
-        mv /tmp/ultraspan_config.tmp "$CONFIG_FILE"
-    fi
-    
-    echo "mode=${MODE:-zoom}" >> "$CONFIG_FILE"
-    echo "bg_type=$BG_TYPE" >> "$CONFIG_FILE"
-    if [ "$BG_TYPE" = "blur" ]; then
-        echo "blur=$BLUR_AMOUNT" >> "$CONFIG_FILE"
-    else
-        echo "color=$BG_COLOR" >> "$CONFIG_FILE"
-    fi
-    echo "random_interval=$interval" >> "$CONFIG_FILE"
+    update_config "random_interval" "$interval"
     
     echo "✅ Random rotation interval set to: $interval minutes"
     
     # Update running random mode if active
     if [ -f "$RANDOM_FILE" ]; then
-    # Save directory and mode BEFORE stopping
-    local random_dir random_mode
-    while IFS='=' read -r key value; do
-        case "$key" in
-            "directory") random_dir="$value" ;;
-            "mode") random_mode="$value" ;;
-        esac
-    done < "$RANDOM_FILE"
-    
-    echo "🔄 Updating running random rotation..."
-    stop_random_mode
-    
-    # Restart with saved values
-    if [ -n "$random_dir" ] && [ -d "$random_dir" ]; then
-        start_random_mode "$random_dir" "$random_mode"
+        # Save directory and mode BEFORE stopping
+        local random_dir random_mode
+        while IFS='=' read -r key value; do
+            case "$key" in
+                "directory") random_dir="$value" ;;
+                "mode") random_mode="$value" ;;
+            esac
+        done < "$RANDOM_FILE"
+        
+        echo "🔄 Updating running random rotation..."
+        stop_random_mode
+        
+        # Restart with saved values
+        if [ -n "$random_dir" ] && [ -d "$random_dir" ]; then
+            start_random_mode "$random_dir" "$random_mode"
+        fi
     fi
-fi
 }
 
 # Show status
@@ -487,7 +496,7 @@ show_status() {
     
     # Current wallpaper
     local current_uri
-    current_uri=$(gsettings get org.cinnamon.desktop.background picture-uri | sed "s/'//g")
+    current_uri=$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null | sed "s/'//g" || echo "Unable to get")
     echo "📷 Current Wallpaper:"
     echo "   $current_uri"
     echo ""
@@ -540,7 +549,7 @@ show_status() {
     if [ -d "$CACHE_DIR" ]; then
         local cache_size cache_count
         cache_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1 || echo "0")
-        cache_count=$(find "$CACHE_DIR" -name "*.jpg" | wc -l)
+        cache_count=$(find "$CACHE_DIR" -name "*.jpg" 2>/dev/null | wc -l || echo "0")
         echo "🗃️  Cache:"
         echo "   Files: $cache_count"
         echo "   Size: $cache_size"
@@ -582,7 +591,7 @@ show_image_info() {
     
     echo "📄 File: $(basename "$image")"
     echo "📁 Path: $image"
-    echo "📏 Size: $(du -h "$image" | cut -f1)"
+    echo "📏 Size: $(du -h "$image" 2>/dev/null | cut -f1 || echo "Unknown")"
     echo ""
     
     # Image dimensions
@@ -653,7 +662,7 @@ list_recent() {
                 date=$(echo "$line" | awk '{print $6, $7, $8}')
                 size=$(du -h "$file" 2>/dev/null | cut -f1)
                 echo "   $(basename "$file") - $size - $date"
-            done
+            done || true
     fi
 }
 
@@ -664,13 +673,12 @@ set_mode() {
     case "$mode" in
         "zoom"|"fit"|"center")
             MODE="$mode"
-            mkdir -p "$CONFIG_DIR"
-            echo "mode=$MODE" > "$CONFIG_FILE"
-            echo "bg_type=$BG_TYPE" >> "$CONFIG_FILE"
+            update_config "mode" "$MODE"
+            update_config "bg_type" "$BG_TYPE"
             if [ "$BG_TYPE" = "blur" ]; then
-                echo "blur=$BLUR_AMOUNT" >> "$CONFIG_FILE"
+                update_config "blur" "$BLUR_AMOUNT"
             else
-                echo "color=$BG_COLOR" >> "$CONFIG_FILE"
+                update_config "color" "$BG_COLOR"
             fi
             echo "✅ Default mode set to: $mode"
             
@@ -699,13 +707,12 @@ set_bg_type() {
     case "$bg_type" in
         "blur"|"solid")
             BG_TYPE="$bg_type"
-            mkdir -p "$CONFIG_DIR"
-            echo "mode=${MODE:-zoom}" > "$CONFIG_FILE"
-            echo "bg_type=$BG_TYPE" >> "$CONFIG_FILE"
+            update_config "mode" "${MODE:-zoom}"
+            update_config "bg_type" "$BG_TYPE"
             if [ "$BG_TYPE" = "blur" ]; then
-                echo "blur=$BLUR_AMOUNT" >> "$CONFIG_FILE"
+                update_config "blur" "$BLUR_AMOUNT"
             else
-                echo "color=$BG_COLOR" >> "$CONFIG_FILE"
+                update_config "color" "$BG_COLOR"
             fi
             echo "✅ Background type set to: $BG_TYPE"
             
@@ -740,10 +747,9 @@ set_blur() {
     fi
     
     BLUR_AMOUNT="$blur_amount"
-    mkdir -p "$CONFIG_DIR"
-    echo "mode=${MODE:-zoom}" > "$CONFIG_FILE"
-    echo "bg_type=$BG_TYPE" >> "$CONFIG_FILE"
-    echo "blur=$BLUR_AMOUNT" >> "$CONFIG_FILE"
+    update_config "mode" "${MODE:-zoom}"
+    update_config "bg_type" "$BG_TYPE"
+    update_config "blur" "$BLUR_AMOUNT"
     echo "✅ Blur amount set to: $BLUR_AMOUNT"
     
     # If there's a recent wallpaper, reapply it with new blur
@@ -763,21 +769,37 @@ set_blur() {
 set_color() {
     local color="$1"
     
-    # Validate color format (simple check for hex)
-    if [[ ! "$color" =~ ^#[0-9A-Fa-f]{6}$ ]]; then
-        echo "❌ Error: Color must be in hex format: #RRGGBB"
-        echo "   Example: #1a1a1a, #FF5733, #3498db"
+    # If color is empty, the # was interpreted as a comment
+    if [ -z "$color" ]; then
+        echo "❌ Error: When using # format, you must use quotes:"
+        echo "   ultraspan color \"#1a1a1a\""
+        echo "   or use without #: ultraspan color 1a1a1a"
         exit 1
     fi
     
-    BG_COLOR="$color"
-    mkdir -p "$CONFIG_DIR"
-    echo "mode=${MODE:-zoom}" > "$CONFIG_FILE"
-    echo "bg_type=$BG_TYPE" >> "$CONFIG_FILE"
-    echo "color=$BG_COLOR" >> "$CONFIG_FILE"
+    # Remove surrounding quotes if present
+    color="${color%\"}"
+    color="${color#\"}"
+    
+    # Remove # for validation
+    local color_clean="${color#\#}"
+    
+    # Validate (6 hex chars)
+    if [[ ! "$color_clean" =~ ^[0-9A-Fa-f]{6}$ ]]; then
+        echo "❌ Error: Invalid color format"
+        echo "   Use: 1a1a1a or \"#1a1a1a\""
+        exit 1
+    fi
+    
+    # Always store with # (consistent format in config)
+    BG_COLOR="#$color_clean"
+    
+    update_config "mode" "${MODE:-zoom}"
+    update_config "bg_type" "$BG_TYPE"
+    update_config "color" "$BG_COLOR"
     echo "✅ Solid color set to: $BG_COLOR"
     
-    # If there's a recent wallpaper, reapply it with new color
+    # Reapply wallpaper if needed
     if [ -f "$STATE_FILE" ]; then
         local recent_image
         recent_image=$(head -n1 "$STATE_FILE")
@@ -795,14 +817,14 @@ clean_cache() {
     echo "🧹 Cleaning wallpaper cache..."
     
     if [ -d "$CACHE_DIR" ]; then
-        local cache_size file_count
+        local cache_size cache_count
         cache_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1 || echo "0")
-        file_count=$(find "$CACHE_DIR" -name "*.jpg" | wc -l)
+        cache_count=$(find "$CACHE_DIR" -name "*.jpg" 2>/dev/null | wc -l || echo "0")
         
         rm -rf "$CACHE_DIR"
         mkdir -p "$CACHE_DIR"
         
-        echo "✅ Cache cleaned: removed $file_count files ($cache_size)"
+        echo "✅ Cache cleaned: removed $cache_count files ($cache_size)"
     else
         echo "ℹ️  Cache directory does not exist"
     fi
