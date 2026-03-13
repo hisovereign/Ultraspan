@@ -6,6 +6,8 @@ Ultraspan is a command-line tool that aims to be a true workaround to the **blur
 
 It pre-renders the final image using ImageMagick, bypassing Cinnamon's caching and scaling. 
 
+Demo: https://youtu.be/hQV6NugUXEQ
+
 ## Features
 
 
