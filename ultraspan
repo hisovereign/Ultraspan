@@ -2,7 +2,7 @@
 # ============================================
 # Combined Single-Span Multi-Monitor Wallpaper Management System
 # ============================================
-# Version 2.8 - made by /home/m = hisovereign
+# Version 2.9 - made by /home/m = hisovereign
 # ============================================
 
 set -e
@@ -15,6 +15,7 @@ CONFIG_FILE="$CONFIG_DIR/config"
 CACHE_DIR="$HOME/.cache/ultraspan"
 STATE_FILE="$CONFIG_DIR/state"
 RANDOM_FILE="$CONFIG_DIR/random"
+REFRESH_FILE="$CONFIG_DIR/refresh"
 LOCK_FILE="/tmp/ultraspan.lock"
 
 # -----------------------------
@@ -57,6 +58,9 @@ COMMANDS:
   random-stop                Stop random rotation
   random-status              Show random rotation status
   interval MINUTES           Set random rotation interval (default: 30)
+  refresh-start [MINUTES]    Start periodic wallpaper refresh to prevent blur
+  refresh-stop               Stop periodic refresh
+  refresh-status             Show refresh status
   list                      List recent wallpapers
   status                    Show current wallpaper and settings
   info IMAGE_PATH           Show image info and preview size
@@ -79,6 +83,8 @@ EXAMPLES:
   ultraspan random ~/Pictures/Wallpapers zoom
   ultraspan color 000000
   ultraspan interval 10
+  ultraspan refresh-start 5
+  ultraspan refresh-stop
   ultraspan status
 EOF
 }
@@ -130,6 +136,7 @@ update_config() {
 set_wallpaper() {
     local image="$1"
     local mode="${2:-zoom}"
+    local force="${3:-false}"  # New force parameter
     
     [ -f "$image" ] || { echo "❌ Error: File not found: $image"; exit 1; }
     
@@ -181,135 +188,149 @@ set_wallpaper() {
         CACHE_FILE="${CACHE_FILE}-${COLOR_CODE}.jpg"
     fi
     
-    echo "⚙️  Processing image..."
+    # Check if we need to regenerate (force mode or file doesn't exist)
+    echo "DEBUG: force=$force, file exists=$([ -f "$CACHE_FILE" ] && echo "yes" || echo "no")"
     
-    # Get image dimensions for info
-    local img_width img_height
-    img_width=$(identify -format "%w" "$image" 2>/dev/null || echo "0")
-    img_height=$(identify -format "%h" "$image" 2>/dev/null || echo "0")
+    if [ "$force" = "true" ]; then
+        echo "⚙️  FORCE MODE: Removing existing cache and regenerating..."
+        rm -f "$CACHE_FILE"
+    fi
     
-    echo "📐 Original image: ${img_width}x${img_height}"
-    
-    # Process based on mode
-    case "$mode" in
-        "zoom")
-            # Zoom to fill (crops if necessary)
-            convert "$image" \
-                -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" \
-                -gravity center \
-                -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                -quality 95 \
-                "$CACHE_FILE"
-            ;;
-            
-        "fit")
-            # Fit image within area
-            echo "  Creating fit mode..."
-            
-            if [ "$BG_TYPE" = "blur" ]; then
-                # Blurred background
-                convert "$image" \
-                    \( -clone 0 -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -blur "0x${BLUR_AMOUNT}" \) \
-                    \( -clone 0 -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \) \
-                    -delete 0 \
-                    -gravity center \
-                    -composite \
-                    -quality 95 \
-                    "$CACHE_FILE"
-            else
-                # Solid color background
-                convert "$image" \
-                    -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                    -background "$BG_COLOR" \
-                    -gravity center \
-                    -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                    -quality 95 \
-                    "$CACHE_FILE"
-            fi
-            ;;
-            
-        "center")
-            # Center image on background - SIMPLIFIED LOGIC
-            echo "  Creating center mode..."
-
-            if [ "$BG_TYPE" = "blur" ]; then
-                # Create temporary files securely
-                blur_bg=$(mktemp) || { echo "❌ Error: Failed to create temp file"; exit 1; }
-                center_fg=$(mktemp) || { echo "❌ Error: Failed to create temp file"; exit 1; }
-
-                # Create blurred background (zoomed to fill)
+    if [ "$force" = "true" ] || [ ! -f "$CACHE_FILE" ]; then
+        echo "⚙️  Processing image (forced: $force)..."
+        
+        # Get image dimensions for info
+        local img_width img_height
+        img_width=$(identify -format "%w" "$image" 2>/dev/null || echo "0")
+        img_height=$(identify -format "%h" "$image" 2>/dev/null || echo "0")
+        
+        echo "📐 Original image: ${img_width}x${img_height}"
+        
+        # Process based on mode
+        case "$mode" in
+            "zoom")
+                # Zoom to fill (crops if necessary)
                 convert "$image" \
                     -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" \
                     -gravity center \
                     -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                    -blur "0x${BLUR_AMOUNT}" \
-                    "$blur_bg"
-    
-                # Create centered image (max 80% of monitor)
-                local fit_width fit_height
-                if [ $img_width -gt $img_height ]; then
-                    fit_width=$((TOTAL_WIDTH * 80 / 100))
-                    fit_height=$((img_height * fit_width / img_width))
-                else
-                    fit_height=$((TOTAL_HEIGHT * 80 / 100))
-                    fit_width=$((img_width * fit_height / img_height))
-                fi
-
-                [ $fit_width -gt $TOTAL_WIDTH ] && fit_width=$TOTAL_WIDTH
-                [ $fit_height -gt $TOTAL_HEIGHT ] && fit_height=$TOTAL_HEIGHT
-
-                echo "  Centered image size: ${fit_width}x${fit_height}"
-
-                convert "$image" \
-                    -resize "${fit_width}x${fit_height}" \
-                    "$center_fg"
-
-                # Composite centered image on blurred background
-                convert "$blur_bg" \
-                    "$center_fg" \
-                    -gravity center \
-                    -composite \
                     -quality 95 \
                     "$CACHE_FILE"
-
-                # Cleanup temporary files
-                rm -f "$blur_bg" "$center_fg"
+                ;;
                 
-            else
-                # Solid color background - SIMPLE APPROACH
-                # Create centered image (max 80% of monitor)
-                local fit_width fit_height
-                if [ $img_width -gt $img_height ]; then
-                    fit_width=$((TOTAL_WIDTH * 80 / 100))
-                    fit_height=$((img_height * fit_width / img_width))
+            "fit")
+                # Fit image within area
+                echo "  Creating fit mode..."
+                
+                if [ "$BG_TYPE" = "blur" ]; then
+                    # Blurred background
+                    convert "$image" \
+                        \( -clone 0 -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -blur "0x${BLUR_AMOUNT}" \) \
+                        \( -clone 0 -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \) \
+                        -delete 0 \
+                        -gravity center \
+                        -composite \
+                        -quality 95 \
+                        "$CACHE_FILE"
                 else
-                    fit_height=$((TOTAL_HEIGHT * 80 / 100))
-                    fit_width=$((img_width * fit_height / img_height))
+                    # Solid color background
+                    convert "$image" \
+                        -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
+                        -background "$BG_COLOR" \
+                        -gravity center \
+                        -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
+                        -quality 95 \
+                        "$CACHE_FILE"
                 fi
+                ;;
                 
-                [ $fit_width -gt $TOTAL_WIDTH ] && fit_width=$TOTAL_WIDTH
-                [ $fit_height -gt $TOTAL_HEIGHT ] && fit_height=$TOTAL_HEIGHT
+            "center")
+                # Center image on background - SIMPLIFIED LOGIC
+                echo "  Creating center mode..."
+
+                if [ "$BG_TYPE" = "blur" ]; then
+                    # Create temporary files securely
+                    blur_bg=$(mktemp) || { echo "❌ Error: Failed to create temp file"; exit 1; }
+                    center_fg=$(mktemp) || { echo "❌ Error: Failed to create temp file"; exit 1; }
+
+                    # Create blurred background (zoomed to fill)
+                    convert "$image" \
+                        -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" \
+                        -gravity center \
+                        -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
+                        -blur "0x${BLUR_AMOUNT}" \
+                        "$blur_bg"
+        
+                    # Create centered image (max 80% of monitor)
+                    local fit_width fit_height
+                    if [ $img_width -gt $img_height ]; then
+                        fit_width=$((TOTAL_WIDTH * 80 / 100))
+                        fit_height=$((img_height * fit_width / img_width))
+                    else
+                        fit_height=$((TOTAL_HEIGHT * 80 / 100))
+                        fit_width=$((img_width * fit_height / img_height))
+                    fi
+
+                    [ $fit_width -gt $TOTAL_WIDTH ] && fit_width=$TOTAL_WIDTH
+                    [ $fit_height -gt $TOTAL_HEIGHT ] && fit_height=$TOTAL_HEIGHT
+
+                    echo "  Centered image size: ${fit_width}x${fit_height}"
+
+                    convert "$image" \
+                        -resize "${fit_width}x${fit_height}" \
+                        "$center_fg"
+
+                    # Composite centered image on blurred background
+                    convert "$blur_bg" \
+                        "$center_fg" \
+                        -gravity center \
+                        -composite \
+                        -quality 95 \
+                        "$CACHE_FILE"
+
+                    # Cleanup temporary files
+                    rm -f "$blur_bg" "$center_fg"
+                    
+                else
+                    # Solid color background - SIMPLE APPROACH
+                    # Create centered image (max 80% of monitor)
+                    local fit_width fit_height
+                    if [ $img_width -gt $img_height ]; then
+                        fit_width=$((TOTAL_WIDTH * 80 / 100))
+                        fit_height=$((img_height * fit_width / img_width))
+                    else
+                        fit_height=$((TOTAL_HEIGHT * 80 / 100))
+                        fit_width=$((img_width * fit_height / img_height))
+                    fi
+                    
+                    [ $fit_width -gt $TOTAL_WIDTH ] && fit_width=$TOTAL_WIDTH
+                    [ $fit_height -gt $TOTAL_HEIGHT ] && fit_height=$TOTAL_HEIGHT
+                    
+                    echo "  Centered image size: ${fit_width}x${fit_height}"
+                    
+                    # Simple version without temporary files
+                    convert "$image" \
+                        -resize "${fit_width}x${fit_height}" \
+                        -background "$BG_COLOR" \
+                        -gravity center \
+                        -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
+                        -quality 95 \
+                        "$CACHE_FILE"
+                fi
+                ;;
                 
-                echo "  Centered image size: ${fit_width}x${fit_height}"
-                
-                # Simple version without temporary files
-                convert "$image" \
-                    -resize "${fit_width}x${fit_height}" \
-                    -background "$BG_COLOR" \
-                    -gravity center \
-                    -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                    -quality 95 \
-                    "$CACHE_FILE"
-            fi
-            ;;
-            
-        *)
-            echo "❌ Error: Unknown mode: $mode. Use: zoom, fit, center"
-            exit 1
-            ;;
-    esac
-    
-    [ -f "$CACHE_FILE" ] || { echo "❌ Error: Image processing failed"; exit 1; }
+            *)
+                echo "❌ Error: Unknown mode: $mode. Use: zoom, fit, center"
+                exit 1
+                ;;
+        esac
+        
+        [ -f "$CACHE_FILE" ] || { echo "❌ Error: Image processing failed"; exit 1; }
+    else
+        echo "⚙️  Using cached image (use force refresh to regenerate)"
+        # Touch the file to update timestamp even when using cache
+        touch "$CACHE_FILE"
+    fi
     
     # Save state
     echo "$image" > "$STATE_FILE"
@@ -328,6 +349,152 @@ set_wallpaper() {
     gsettings set org.cinnamon.desktop.background picture-options "spanned"
     
     echo "✅ Wallpaper set successfully!"
+}
+
+# Refresh current wallpaper (reapply to fix blur)
+refresh_wallpaper() {
+    if [ -f "$STATE_FILE" ]; then
+        local recent_image
+        local recent_mode
+        recent_image=$(head -n1 "$STATE_FILE")
+        recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
+        
+        if [ -f "$recent_image" ]; then
+            echo "🔄 Refreshing wallpaper to prevent blur..."
+            set_wallpaper "$recent_image" "$recent_mode"
+            return 0
+        else
+            echo "⚠️ No valid wallpaper found to refresh"
+            return 1
+        fi
+    else
+        echo "⚠️ No wallpaper state found"
+        return 1
+    fi
+}
+
+# Start periodic refresh mode
+start_refresh_mode() {
+    local interval="${1:-5}"  # Default to 5 minutes if not specified
+    
+    # Validate interval
+    if [[ ! "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
+        echo "❌ Error: Interval must be a positive number (minutes)"
+        exit 1
+    fi
+    
+    echo "🔄 Starting periodic wallpaper refresh every $interval minutes"
+    echo "   This will reapply the current wallpaper to prevent blurring"
+    
+    # Save refresh settings
+    mkdir -p "$CONFIG_DIR"
+    echo "interval=$interval" > "$REFRESH_FILE"
+    echo "pid=$$" >> "$REFRESH_FILE"
+    
+    # Function to refresh wallpaper (FORCED VERSION)
+    do_refresh() {
+        while true; do
+            sleep $((interval * 60))
+            
+            # Check if still running
+            [ ! -f "$REFRESH_FILE" ] && exit 0
+            
+            # Check if there's a current wallpaper to refresh
+            if [ -f "$STATE_FILE" ]; then
+                local recent_image
+                local recent_mode
+                recent_image=$(head -n1 "$STATE_FILE")
+                recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
+                
+                if [ -f "$recent_image" ]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - 🔄 Auto-refreshing wallpaper: $(basename "$recent_image")"
+                    
+                    # Force regeneration by passing "true" as third parameter
+                    /home/m/.local/bin/ultraspan set "$recent_image" "$recent_mode" "true" > /tmp/ultraspan-debug.log 2>&1
+                fi
+            fi
+        done
+    }
+    
+    # Start refresh process in background
+    do_refresh &
+    local refresh_pid=$!
+    echo $refresh_pid >> "$REFRESH_FILE"
+    
+    echo "✅ Periodic refresh started (PID: $refresh_pid)"
+    disown
+}
+
+# Stop periodic refresh
+stop_refresh_mode() {
+    if [ -f "$REFRESH_FILE" ]; then
+        # Get PID from file (last line)
+        local pid
+        pid=$(tail -n1 "$REFRESH_FILE" 2>/dev/null)
+        
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            echo "⏹️ Periodic refresh stopped"
+        else
+            echo "⚠️ Periodic refresh not running"
+        fi
+        
+        rm -f "$REFRESH_FILE"
+    else
+        echo "⚠️ Periodic refresh not active"
+    fi
+}
+
+# Show refresh status (FIXED VERSION)
+show_refresh_status() {
+    if [ -f "$REFRESH_FILE" ]; then
+        echo "=== Periodic Refresh Status ==="
+        echo ""
+        
+        # Read settings
+        local INTERVAL=""
+        local PID=""
+        while IFS='=' read -r key value; do
+            case "$key" in
+                "interval") INTERVAL="$value" ;;
+                "pid") PID="$value" ;;
+            esac
+        done < <(head -n 2 "$REFRESH_FILE")  # Only read first two lines
+        
+        # Also check if there's a PID on line 3 (the child process)
+        local CHILD_PID
+        CHILD_PID=$(sed -n '3p' "$REFRESH_FILE" 2>/dev/null)
+        
+        echo "⏰ Interval: $INTERVAL minutes"
+        
+        # Check if either PID is running
+        local RUNNING_PID=""
+        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+            RUNNING_PID="$CHILD_PID"
+        elif [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            RUNNING_PID="$PID"
+        fi
+        
+        if [ -n "$RUNNING_PID" ]; then
+            echo "Status: Running (PID: $RUNNING_PID)"
+            
+            # Next refresh time
+            local next_time
+            next_time=$(date -d "+$INTERVAL minutes" '+%H:%M:%S')
+            echo "⏱️ Next refresh: ~$next_time"
+            
+            # Last refresh time (from state file)
+            if [ -f "$STATE_FILE" ]; then
+                local last_time
+                last_time=$(tail -n1 "$STATE_FILE" 2>/dev/null)
+                echo "🕐 Last refresh: $last_time"
+            fi
+        else
+            echo "🔴 Status: Not running (stale config)"
+        fi
+    else
+        echo "ℹ️ Periodic refresh is not active"
+    fi
 }
 
 # Random wallpaper functions
@@ -542,6 +709,17 @@ show_status() {
                 "interval") echo "   Interval: $value minutes" ;;
             esac
         done < "$RANDOM_FILE"
+    fi
+    
+    # Refresh status
+    if [ -f "$REFRESH_FILE" ]; then
+        echo ""
+        echo "🔄 Periodic Refresh: Active"
+        while IFS='=' read -r key value; do
+            case "$key" in
+                "interval") echo "   Interval: $value minutes" ;;
+            esac
+        done < "$REFRESH_FILE"
     fi
     echo ""
     
@@ -904,15 +1082,24 @@ case "$COMMAND" in
     "set")
         if [ -z "${2:-}" ]; then
             echo "❌ Error: No image specified"
-            echo "   Usage: ultraspan set IMAGE_PATH [MODE]"
+            echo "   Usage: ultraspan set IMAGE_PATH [MODE] [true/false]"
             exit 1
         fi
         
         # Get default mode from config
         DEFAULT_MODE=$(get_default_mode)
         
-        # Call set_wallpaper with image and mode
-        set_wallpaper "$2" "${3:-$DEFAULT_MODE}"
+        # Set mode (3rd argument or default)
+        MODE_TO_USE="${3:-$DEFAULT_MODE}"
+        
+        # Set force flag (4th argument, default to false)
+        FORCE_FLAG="false"
+        if [ "${4:-}" = "true" ]; then
+            FORCE_FLAG="true"
+        fi
+        
+        # Call set_wallpaper with all parameters
+        set_wallpaper "$2" "$MODE_TO_USE" "$FORCE_FLAG"
         ;;
         
     "random-stop")
@@ -949,6 +1136,22 @@ case "$COMMAND" in
         else
             set_interval "$2"
         fi
+        ;;
+        
+    "refresh-start")
+        # Stop any existing refresh first
+        stop_refresh_mode
+        
+        # Start refresh with specified interval (default 5 minutes)
+        start_refresh_mode "${2:-5}"
+        ;;
+        
+    "refresh-stop")
+        stop_refresh_mode
+        ;;
+        
+    "refresh-status")
+        show_refresh_status
         ;;
         
     "status")
