@@ -104,6 +104,26 @@ Type in terminal: ultraspan COMMAND [arguments]
 
       ultraspan color "#3498db"
 
+### Set at start
+
+In order for auto-refresh feature to persist past reboot you will need to add ultraspan to startup applications with a command. 
+
+
+1. menu>start up applications
+
+2. hit the + (add) custom command
+
+3. search for ultraspan in ~/.local/bin/ and then click open
+
+4. You then need to add to the end of the command:
+
+        refresh-start 180
+
+   (eg. /bin/ultraspan refresh-start 180) 
+   
+This will run the refresh command at launch and reapply current wallpaper every 3 hours (can change to users pref)
+
+
 #### How it works
 
 1. xrandr determines the total bounding box of all monitors
