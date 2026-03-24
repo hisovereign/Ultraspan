@@ -8,6 +8,8 @@ It pre-renders the final image using ImageMagick, bypassing Cinnamon's caching a
 
 Demo: https://youtu.be/hQV6NugUXEQ
 
+Note- make sure to restart cinnamon or reboot after updating script
+
 ## Features
 
 
