@@ -2,7 +2,7 @@
 # ============================================
 # Combined Single-Span Multi-Monitor Wallpaper Management System
 # ============================================
-# Version 2.9 - made by /home/m = hisovereign
+# Version 3.0 - made by /home/m = hisovereign
 # ============================================
 
 set -e
@@ -17,6 +17,7 @@ STATE_FILE="$CONFIG_DIR/state"
 RANDOM_FILE="$CONFIG_DIR/random"
 REFRESH_FILE="$CONFIG_DIR/refresh"
 LOCK_FILE="/tmp/ultraspan.lock"
+FULLSCREEN_FILE="$CONFIG_DIR/fullscreen"
 
 # -----------------------------
 # SINGLE-INSTANCE LOCK
@@ -38,6 +39,7 @@ trap cleanup_lock EXIT
 BLUR_AMOUNT=15
 BG_COLOR="#000000"
 BG_TYPE="blur"
+FULLSCREEN_PAUSE="true"
 
 # -----------------------------
 # HELPER FUNCTIONS
@@ -64,6 +66,7 @@ COMMANDS:
   list                      List recent wallpapers
   status                    Show current wallpaper and settings
   info IMAGE_PATH           Show image info and preview size
+  fullscreen [on|off]        Enable/disable auto-pause during fullscreen apps (default: on)
   restore                    Restore default system wallpaper
   clean                      Clear wallpaper cache
   help                       Show this help
@@ -87,6 +90,101 @@ EXAMPLES:
   ultraspan refresh-stop
   ultraspan status
 EOF
+}
+
+# Check if any full-screen window is active
+is_fullscreen_active() {
+    # Check active window
+    local active_window
+    active_window=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $5}')
+    
+    if [ -n "$active_window" ]; then
+        # Check if window is fullscreen
+        local window_state
+        window_state=$(xprop -id "$active_window" _NET_WM_STATE 2>/dev/null)
+        
+        if echo "$window_state" | grep -q "_NET_WM_STATE_FULLSCREEN"; then
+            return 0  # Fullscreen active
+        fi
+    fi
+    
+    return 1  # No fullscreen
+}
+
+# Monitor fullscreen state and control background processes
+monitor_fullscreen() {
+    local was_fullscreen=false
+    local refresh_pid=""
+    local random_pid=""
+    
+    while true; do
+        sleep 2  # Check every 2 seconds
+        
+        # Get current PIDs if they exist
+        if [ -f "$REFRESH_FILE" ]; then
+            refresh_pid=$(tail -n1 "$REFRESH_FILE" 2>/dev/null)
+        fi
+        if [ -f "$RANDOM_FILE" ]; then
+            random_pid=$(tail -n1 "$RANDOM_FILE" 2>/dev/null)
+        fi
+        
+        if is_fullscreen_active; then
+            if [ "$was_fullscreen" = false ]; then
+                echo "🎬 Full-screen detected - pausing wallpaper services"
+                # Pause refresh
+                if [ -n "$refresh_pid" ] && kill -STOP "$refresh_pid" 2>/dev/null; then
+                    echo "   ⏸️  Refresh paused"
+                fi
+                # Pause random
+                if [ -n "$random_pid" ] && kill -STOP "$random_pid" 2>/dev/null; then
+                    echo "   ⏸️  Random rotation paused"
+                fi
+                was_fullscreen=true
+            fi
+        else
+            if [ "$was_fullscreen" = true ]; then
+                echo "🎬 Full-screen ended - resuming wallpaper services"
+                # Resume refresh
+                if [ -n "$refresh_pid" ] && kill -CONT "$refresh_pid" 2>/dev/null; then
+                    echo "   ▶️  Refresh resumed"
+                fi
+                # Resume random
+                if [ -n "$random_pid" ] && kill -CONT "$random_pid" 2>/dev/null; then
+                    echo "   ▶️  Random rotation resumed"
+                fi
+                was_fullscreen=false
+            fi
+        fi
+    done
+}
+
+# Monitor display layout changes
+monitor_layout() {
+    local last_layout=""
+    
+    while true; do
+        sleep 2
+        # Get current layout hash
+        local current_layout
+        current_layout=$(xrandr --listmonitors 2>/dev/null | sha1sum | cut -d' ' -f1)
+        
+        if [ -n "$last_layout" ] && [ "$current_layout" != "$last_layout" ]; then
+            echo "🖥️  Display layout changed - reapplying wallpaper..."
+            # Reapply last wallpaper
+            if [ -f "$STATE_FILE" ]; then
+                local recent_image
+                local recent_mode
+                recent_image=$(head -n1 "$STATE_FILE")
+                recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
+                
+                if [ -f "$recent_image" ]; then
+                    "$0" set "$recent_image" "$recent_mode" "true" > /dev/null 2>&1 || true
+                fi
+            fi
+        fi
+        
+        last_layout="$current_layout"
+    done
 }
 
 # Load config
@@ -375,7 +473,7 @@ refresh_wallpaper() {
 
 # Start periodic refresh mode
 start_refresh_mode() {
-    local interval="${1:-5}"  # Default to 5 minutes if not specified
+    local interval="${1:-180}"  # Default to 3 hours if not specified
     
     # Validate interval
     if [[ ! "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
@@ -410,7 +508,7 @@ start_refresh_mode() {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - 🔄 Auto-refreshing wallpaper: $(basename "$recent_image")"
                     
                     # Force regeneration by passing "true" as third parameter
-                    /home/m/.local/bin/ultraspan set "$recent_image" "$recent_mode" "true" > /tmp/ultraspan-debug.log 2>&1
+                    "$0" set "$recent_image" "$recent_mode" "true" > /tmp/ultraspan-debug.log 2>&1
                 fi
             fi
         done
@@ -420,6 +518,19 @@ start_refresh_mode() {
     do_refresh &
     local refresh_pid=$!
     echo $refresh_pid >> "$REFRESH_FILE"
+    
+    # Start fullscreen monitor if enabled
+    if [ "$FULLSCREEN_PAUSE" = "true" ]; then
+        monitor_fullscreen &
+        local monitor_pid=$!
+        echo "$monitor_pid" >> "$FULLSCREEN_FILE"
+    fi
+    
+        # Start layout monitor if not already running
+    if [ ! -f "$CONFIG_DIR/layout_monitor.pid" ]; then
+        monitor_layout &
+        echo $! > "$CONFIG_DIR/layout_monitor.pid"
+    fi
     
     echo "✅ Periodic refresh started (PID: $refresh_pid)"
     disown
@@ -442,6 +553,24 @@ stop_refresh_mode() {
         rm -f "$REFRESH_FILE"
     else
         echo "⚠️ Periodic refresh not active"
+    fi
+    
+    # Kill fullscreen monitor if running
+    if [ -f "$FULLSCREEN_FILE" ]; then
+        local monitor_pid
+        monitor_pid=$(cat "$FULLSCREEN_FILE" 2>/dev/null)
+        if [ -n "$monitor_pid" ] && kill -0 "$monitor_pid" 2>/dev/null; then
+            kill "$monitor_pid" 2>/dev/null || true
+        fi
+        rm -f "$FULLSCREEN_FILE"
+    fi
+    
+    # Kill layout monitor
+    if [ -f "$CONFIG_DIR/layout_monitor.pid" ]; then
+        local layout_pid
+        layout_pid=$(cat "$CONFIG_DIR/layout_monitor.pid")
+        kill "$layout_pid" 2>/dev/null || true
+        rm -f "$CONFIG_DIR/layout_monitor.pid"
     fi
 }
 
@@ -990,6 +1119,28 @@ set_color() {
     fi
 }
 
+# Toggle fullscreen pause
+set_fullscreen_pause() {
+    local setting="$1"
+    
+    case "$setting" in
+        "on"|"true"|"1")
+            FULLSCREEN_PAUSE="true"
+            update_config "fullscreen_pause" "true"
+            echo "✅ Full-screen pause ENABLED - wallpaper services will pause during fullscreen apps"
+            ;;
+        "off"|"false"|"0")
+            FULLSCREEN_PAUSE="false"
+            update_config "fullscreen_pause" "false"
+            echo "✅ Full-screen pause DISABLED - wallpaper services run normally during fullscreen apps"
+            ;;
+        *)
+            echo "📺 Full-screen pause is currently: $FULLSCREEN_PAUSE"
+            echo "   Usage: ultraspan fullscreen [on|off]"
+            ;;
+    esac
+}
+
 # Clean cache
 clean_cache() {
     echo "🧹 Cleaning wallpaper cache..."
@@ -1217,6 +1368,25 @@ case "$COMMAND" in
         clean_cache
         ;;
         
+        "fullscreen")
+        if [ -z "${2:-}" ]; then
+            # Show current setting
+            load_config
+            echo "📺 Full-screen pause is currently: ${FULLSCREEN_PAUSE:-true}"
+            echo "   Usage: ultraspan fullscreen [on|off]"
+        else
+            set_fullscreen_pause "$2"
+            # Restart refresh if running to apply new setting
+            if [ -f "$REFRESH_FILE" ]; then
+                local interval
+                interval=$(head -n1 "$REFRESH_FILE" | cut -d= -f2)
+                echo "🔄 Restarting refresh to apply new fullscreen setting..."
+                stop_refresh_mode
+                start_refresh_mode "$interval"
+            fi
+        fi
+        ;;
+    
     "help"|"--help"|"-h")
         show_help
         ;;
