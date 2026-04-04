@@ -56,7 +56,7 @@ Install dependencies
 
     - Type and hit enter
 
-          chmod +x ultraspan
+          chmod +x ~/.local/bin/ultraspan
     - Then type 
 
           ultraspan
