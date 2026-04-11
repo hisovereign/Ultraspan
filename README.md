@@ -136,7 +136,17 @@ This will run the refresh command at launch and reapply current wallpaper every 
 
 4. gsettings tells Cinnamon to use this static file with picture-options=spanned.
   
+#### Ultraspan cinnamon applet installation
 
+Copy the ultraspan@hisovereign folder and place it in ~/.local/share/cinnamon/applets
+
+-Create a new folder in ~/.local/share/cinnamon/applets and name it ultraspan@hisovereign
+
+-download the applet.js and metadata.json and palce it in folder you made
+
+-restart cinnamon (alt + F2, type r then hit enter) or restart pc
+
+-Right-click on panel > click on applets> add ultraspan applet to panel
 **Acknowledgments**
 
 - Monitor geometry logic detection adaptaded from [`fade-monitors`](https://github.com/hisovereign/fade-monitors) script
