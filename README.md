@@ -1,6 +1,6 @@
 # Ultraspan 
 
-- Combined single-span wallpaper Manager
+- Combined single-span wallpaper utility
 
 Ultraspan is a command-line tool that aims to be a true workaround to the **blurry wallpaper bug** in Linux Mint Cinnamon when using multiple monitors. 
 
@@ -135,7 +135,8 @@ This will run the refresh command at launch and reapply current wallpaper every 
 3. The resulting image is saved with a filename derived from the image hash, settings, and monitor dimensions.
 
 4. gsettings tells Cinnamon to use this static file with picture-options=spanned.
-  
+
+5. Auto-refresh resets wallpaper at set time intervals just in case  
 #### Ultraspan cinnamon applet installation
 
 Copy the ultraspan@hisovereign folder and place it in ~/.local/share/cinnamon/applets
