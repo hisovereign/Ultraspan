@@ -148,6 +148,7 @@ Copy the ultraspan@hisovereign folder and place it in ~/.local/share/cinnamon/ap
 -restart cinnamon (alt + F2, type r then hit enter) or restart pc
 
 -Right-click on panel > click on applets> add ultraspan applet to panel
+
 **Acknowledgments**
 
 - Monitor geometry logic detection adaptaded from [`fade-monitors`](https://github.com/hisovereign/fade-monitors) script
