@@ -302,7 +302,7 @@ class UltraspanApplet extends Applet.IconApplet {
         this._addSettingsSubMenu();
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        let refreshItem = new PopupMenu.PopupMenuItem("⟳ " + _("Refresh"));
+        let refreshItem = new PopupMenu.PopupMenuItem("⟳ " + _("Refresh menu"));
         refreshItem.connect('activate', () => {
             this._rebuildMenu();
         });
