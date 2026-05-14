@@ -1293,8 +1293,8 @@ case "$COMMAND" in
         # Stop any existing refresh first
         stop_refresh_mode
         
-        # Start refresh with specified interval (default 5 minutes)
-        start_refresh_mode "${2:-5}"
+        # Start refresh with specified interval (default 180 minutes)
+        start_refresh_mode "${2:-180}"
         ;;
         
     "refresh-stop")
