@@ -1,15 +1,13 @@
 #!/bin/bash
 # ============================================
-# Combined Single-Span Multi-Monitor Wallpaper Management System
+# Combined Single-Span Multi-Monitor Wallpaper Utility
 # ============================================
-# Version 3.0 - made by /home/m = hisovereign
+# Version 4.1 - Brought to you by hisovereign
 # ============================================
 
-set -e
+export MAGICK_THREAD_LIMIT=1   # optional: remove this line if you want full speed
 
-# -----------------------------
-# CONFIGURATION
-# -----------------------------
+VERSION="4.1"
 CONFIG_DIR="$HOME/.config/ultraspan"
 CONFIG_FILE="$CONFIG_DIR/config"
 CACHE_DIR="$HOME/.cache/ultraspan"
@@ -18,6 +16,26 @@ RANDOM_FILE="$CONFIG_DIR/random"
 REFRESH_FILE="$CONFIG_DIR/refresh"
 LOCK_FILE="/tmp/ultraspan.lock"
 FULLSCREEN_FILE="$CONFIG_DIR/fullscreen"
+LAYOUT_MONITOR_PIDFILE="$CONFIG_DIR/layout_monitor.pid"
+LOG_FILE="$CACHE_DIR/ultraspan.log"
+DEBUG=false
+
+# Default settings
+MODE="zoom"
+BG_TYPE="blur"
+BLUR_AMOUNT=15
+BG_COLOR="#000000"
+FULLSCREEN_PAUSE="true"
+RANDOM_INTERVAL=30
+
+# ImageMagick detection
+if command -v magick &>/dev/null; then
+    IM_CMD="magick"
+    IM_IDENTIFY="magick identify"
+else
+    IM_CMD="convert"
+    IM_IDENTIFY="identify"
+fi
 
 # -----------------------------
 # SINGLE-INSTANCE LOCK
@@ -28,216 +46,138 @@ if ! flock -n 9; then
     exit 1
 fi
 
-# Ensure lock is released on script exit
-cleanup_lock() {
+cleanup() {
     flock -u 9 2>/dev/null
     exec 9>&-
-}
-trap cleanup_lock EXIT
-
-# Default settings
-BLUR_AMOUNT=15
-BG_COLOR="#000000"
-BG_TYPE="blur"
-FULLSCREEN_PAUSE="true"
-
-# -----------------------------
-# HELPER FUNCTIONS
-# -----------------------------
-
-show_help() {
-    cat << 'EOF'
-Ultraspan - Combined Single-Span Wallpaper Manager
-================================================
-
-COMMANDS:
-  set IMAGE_PATH [MODE]      Set wallpaper with optional mode
-  mode MODE                  Set default mode: zoom, fit, center
-  bg-type [TYPE]            Set background type: blur, solid
-  blur [0-100]              Set blur amount (default: 15)
-  color [COLOR]             Set solid color (hex: "#RRGGBB" or RRGGBB)
-  random DIR [MODE]          Start random rotation from directory
-  random-stop                Stop random rotation
-  random-status              Show random rotation status
-  interval MINUTES           Set random rotation interval (default: 30)
-  refresh-start [MINUTES]    Start periodic wallpaper refresh to prevent blur
-  refresh-stop               Stop periodic refresh
-  refresh-status             Show refresh status
-  list                      List recent wallpapers
-  status                    Show current wallpaper and settings
-  info IMAGE_PATH           Show image info and preview size
-  fullscreen [on|off]        Enable/disable auto-pause during fullscreen apps (default: on)
-  restore                    Restore default system wallpaper
-  clean                      Clear wallpaper cache
-  help                       Show this help
-
-MODES:
-  zoom      - Crop and zoom to fill all monitors
-  fit       - Fit image within space (with background)
-  center    - Center image (with background)
-
-BACKGROUND TYPES:
-  blur      - Use blurred version of image as background
-  solid     - Use solid color as background
-
-EXAMPLES:
-  ultraspan set ~/Pictures/wallpaper.jpg
-  ultraspan set ~/Pictures/landscape.jpg fit
-  ultraspan random ~/Pictures/Wallpapers zoom
-  ultraspan color 000000
-  ultraspan interval 10
-  ultraspan refresh-start 5
-  ultraspan refresh-stop
-  ultraspan status
-EOF
-}
-
-# Check if any full-screen window is active
-is_fullscreen_active() {
-    # Check active window
-    local active_window
-    active_window=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $5}')
-    
-    if [ -n "$active_window" ]; then
-        # Check if window is fullscreen
-        local window_state
-        window_state=$(xprop -id "$active_window" _NET_WM_STATE 2>/dev/null)
-        
-        if echo "$window_state" | grep -q "_NET_WM_STATE_FULLSCREEN"; then
-            return 0  # Fullscreen active
+    if [ -f "$LAYOUT_MONITOR_PIDFILE" ]; then
+        local pid
+        pid=$(cat "$LAYOUT_MONITOR_PIDFILE" 2>/dev/null)
+        if [ "$pid" = "$$" ] || kill -0 "$pid" 2>/dev/null; then
+            rm -f "$LAYOUT_MONITOR_PIDFILE"
         fi
     fi
-    
-    return 1  # No fullscreen
+}
+trap cleanup EXIT
+
+debug_log() {
+    [ "$DEBUG" = true ] && echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE"
 }
 
-# Monitor fullscreen state and control background processes
-monitor_fullscreen() {
-    local was_fullscreen=false
-    local refresh_pid=""
-    local random_pid=""
-    
-    while true; do
-        sleep 2  # Check every 2 seconds
-        
-        # Get current PIDs if they exist
-        if [ -f "$REFRESH_FILE" ]; then
-            refresh_pid=$(tail -n1 "$REFRESH_FILE" 2>/dev/null)
+# ---------- Monitor geometry helpers (unchanged) ----------
+get_monitor_info() {
+    unset MONITOR_NAMES MONITOR_X MONITOR_Y MONITOR_W MONITOR_H
+    MIN_X=99999; MIN_Y=99999; MAX_X=0; MAX_Y=0
+    local index=0
+    while IFS= read -r line; do
+        if [[ $line =~ ([0-9]+:[[:space:]]+[\+\*]*)([A-Za-z0-9-]+)[[:space:]]+([0-9]+)\/[0-9]+x([0-9]+)\/[0-9]+\+([0-9]+)\+([0-9]+) ]]; then
+            MONITOR_NAMES[index]="${BASH_REMATCH[2]}"
+            MONITOR_X[index]="${BASH_REMATCH[5]}"
+            MONITOR_Y[index]="${BASH_REMATCH[6]}"
+            MONITOR_W[index]="${BASH_REMATCH[3]}"
+            MONITOR_H[index]="${BASH_REMATCH[4]}"
+            (( MONITOR_X[index] < MIN_X )) && MIN_X=${MONITOR_X[index]}
+            (( MONITOR_Y[index] < MIN_Y )) && MIN_Y=${MONITOR_Y[index]}
+            local x2=$((MONITOR_X[index] + MONITOR_W[index]))
+            local y2=$((MONITOR_Y[index] + MONITOR_H[index]))
+            (( x2 > MAX_X )) && MAX_X=$x2
+            (( y2 > MAX_Y )) && MAX_Y=$y2
+            ((index++))
         fi
-        if [ -f "$RANDOM_FILE" ]; then
-            random_pid=$(tail -n1 "$RANDOM_FILE" 2>/dev/null)
-        fi
-        
-        if is_fullscreen_active; then
-            if [ "$was_fullscreen" = false ]; then
-                echo "🎬 Full-screen detected - pausing wallpaper services"
-                # Pause refresh
-                if [ -n "$refresh_pid" ] && kill -STOP "$refresh_pid" 2>/dev/null; then
-                    echo "   ⏸️  Refresh paused"
-                fi
-                # Pause random
-                if [ -n "$random_pid" ] && kill -STOP "$random_pid" 2>/dev/null; then
-                    echo "   ⏸️  Random rotation paused"
-                fi
-                was_fullscreen=true
-            fi
-        else
-            if [ "$was_fullscreen" = true ]; then
-                echo "🎬 Full-screen ended - resuming wallpaper services"
-                # Resume refresh
-                if [ -n "$refresh_pid" ] && kill -CONT "$refresh_pid" 2>/dev/null; then
-                    echo "   ▶️  Refresh resumed"
-                fi
-                # Resume random
-                if [ -n "$random_pid" ] && kill -CONT "$random_pid" 2>/dev/null; then
-                    echo "   ▶️  Random rotation resumed"
-                fi
-                was_fullscreen=false
-            fi
-        fi
-    done
+    done < <(xrandr --listmonitors 2>/dev/null)
+    MONITOR_COUNT=$index
 }
 
-# Monitor display layout changes
-monitor_layout() {
-    local last_layout=""
-    
-    while true; do
-        sleep 2
-        # Get current layout hash
-        local current_layout
-        current_layout=$(xrandr --listmonitors 2>/dev/null | sha1sum | cut -d' ' -f1)
-        
-        if [ -n "$last_layout" ] && [ "$current_layout" != "$last_layout" ]; then
-            echo "🖥️  Display layout changed - reapplying wallpaper..."
-            # Reapply last wallpaper
-            if [ -f "$STATE_FILE" ]; then
-                local recent_image
-                local recent_mode
-                recent_image=$(head -n1 "$STATE_FILE")
-                recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
-                
-                if [ -f "$recent_image" ]; then
-                    "$0" set "$recent_image" "$recent_mode" "true" > /dev/null 2>&1 || true
-                fi
-            fi
-        fi
-        
-        last_layout="$current_layout"
-    done
+get_total_span() {
+    get_monitor_info
+    TOTAL_WIDTH=$((MAX_X - MIN_X))
+    TOTAL_HEIGHT=$((MAX_Y - MIN_Y))
 }
 
-# Load config
+# ---------- Config helpers (unchanged) ----------
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
+        local key value
         while IFS='=' read -r key value; do
+            key="${key## }"; key="${key%% }"
+            value="${value## }"; value="${value%% }"
             case "$key" in
                 "mode") MODE="$value" ;;
                 "bg_type") BG_TYPE="$value" ;;
                 "blur") BLUR_AMOUNT="$value" ;;
                 "color") BG_COLOR="$value" ;;
+                "fullscreen_pause") FULLSCREEN_PAUSE="$value" ;;
+                "random_interval") RANDOM_INTERVAL="$value" ;;
             esac
         done < "$CONFIG_FILE"
     fi
 }
 
-# Get default mode
 get_default_mode() {
     load_config
     echo "${MODE:-zoom}"
 }
 
-# Update a single config key
 update_config() {
     local key="$1"
     local value="$2"
     local temp_file
-    
     mkdir -p "$CONFIG_DIR"
     temp_file=$(mktemp)
-    
-    # If config exists, copy it, removing the target key if present
     if [ -f "$CONFIG_FILE" ]; then
         grep -v "^${key}=" "$CONFIG_FILE" > "$temp_file" 2>/dev/null || true
     else
         touch "$temp_file"
     fi
-    
-    # Add the new key/value pair
     echo "${key}=${value}" >> "$temp_file"
-    
-    # Move back atomically
     mv "$temp_file" "$CONFIG_FILE"
 }
 
-# Set wallpaper with specified mode
+# ---------- Image processing for a single monitor area ----------
+process_image_for_area() {
+    local image="$1"
+    local area_w="$2"
+    local area_h="$3"
+    local mode="$4"
+    local outfile
+    outfile=$(mktemp) || { echo "❌ Failed to create temp file" >&2; return 1; }
+
+    local img_w img_h
+    img_w=$($IM_IDENTIFY -format "%w" "$image" 2>/dev/null) || img_w=0
+    img_h=$($IM_IDENTIFY -format "%h" "$image" 2>/dev/null) || img_h=0
+
+    case "$mode" in
+        zoom)
+            $IM_CMD "$image" -resize "${area_w}x${area_h}^" -gravity center -extent "${area_w}x${area_h}" "$outfile"
+            ;;
+        fit)
+            $IM_CMD "$image" -resize "${area_w}x${area_h}" "$outfile"
+            ;;
+        center)
+            local fit_w fit_h
+            if [ "$img_w" -gt "$img_h" ]; then
+                fit_w=$(( area_w * 80 / 100 ))
+                fit_h=$(( img_h * fit_w / img_w ))
+            else
+                fit_h=$(( area_h * 80 / 100 ))
+                fit_w=$(( img_w * fit_h / img_h ))
+            fi
+            [ "$fit_w" -gt "$area_w" ] && fit_w=$area_w
+            [ "$fit_h" -gt "$area_h" ] && fit_h=$area_h
+            $IM_CMD "$image" -resize "${fit_w}x${fit_h}" "$outfile"
+            ;;
+        *) echo "❌ Unknown mode: $mode" >&2; return 1 ;;
+    esac
+    echo "$outfile"
+}
+
+# ---------- Single wallpaper (unchanged) ----------
 set_wallpaper() {
     local image="$1"
     local mode="${2:-zoom}"
-    local force="${3:-false}"  # New force parameter
-    
+    local force="${3:-false}"
+
     [ -f "$image" ] || { echo "❌ Error: File not found: $image"; exit 1; }
-    
+
     echo "🎨 Setting wallpaper: $(basename "$image")"
     echo "📐 Mode: $mode"
     echo "🎨 Background: $BG_TYPE"
@@ -246,191 +186,85 @@ set_wallpaper() {
     else
         echo "🎨 Solid color: $BG_COLOR"
     fi
-    
-    # Get monitor layout
-    XRANDR_OUT=$(xrandr --listmonitors 2>/dev/null) || { echo "❌ Error: Cannot get monitor information"; exit 1; }
-    
-    local MIN_X=99999 MIN_Y=99999 MAX_X=0 MAX_Y=0
-    while IFS= read -r line; do
-        if [[ $line =~ ([0-9]+:[[:space:]]+[\+\*]*)([A-Za-z0-9-]+)[[:space:]]+([0-9]+)\/[0-9]+x([0-9]+)\/[0-9]+\+([0-9]+)\+([0-9]+) ]]; then
-            local W="${BASH_REMATCH[3]}" H="${BASH_REMATCH[4]}" X="${BASH_REMATCH[5]}" Y="${BASH_REMATCH[6]}"
-            [ $X -lt $MIN_X ] && MIN_X=$X
-            [ $Y -lt $MIN_Y ] && MIN_Y=$Y
-            local X2=$((X + W))
-            local Y2=$((Y + H))
-            [ $X2 -gt $MAX_X ] && MAX_X=$X2
-            [ $Y2 -gt $MAX_Y ] && MAX_Y=$Y2
-        fi
-    done <<< "$XRANDR_OUT"
-    
-    local TOTAL_WIDTH=$((MAX_X - MIN_X))
-    local TOTAL_HEIGHT=$((MAX_Y - MIN_Y))
-    
-    [ $TOTAL_WIDTH -eq 0 ] || [ $TOTAL_HEIGHT -eq 0 ] && { echo "❌ Error: Could not determine monitor layout"; exit 1; }
-    
+
+    get_total_span
+    [ "$TOTAL_WIDTH" -eq 0 ] || [ "$TOTAL_HEIGHT" -eq 0 ] && { echo "❌ Error: Could not determine monitor layout"; exit 1; }
+
     echo "🖥️  Monitor span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
-    
-    # Create cache directory
+
     mkdir -p "$CACHE_DIR"
     mkdir -p "$(dirname "$STATE_FILE")"
-    
-    # Generate cache filename with all settings
-    local HASH
-    HASH=$(sha1sum "$image" | cut -d' ' -f1)
-    local CACHE_FILE="$CACHE_DIR/${HASH:0:12}-${TOTAL_WIDTH}x${TOTAL_HEIGHT}-${mode}-${BG_TYPE}"
-    if [ "$BG_TYPE" = "blur" ]; then
-        CACHE_FILE="${CACHE_FILE}-blur${BLUR_AMOUNT}.jpg"
-    else
-        # Use color without # for filename
-        local COLOR_CODE=${BG_COLOR//#/}
-        CACHE_FILE="${CACHE_FILE}-${COLOR_CODE}.jpg"
-    fi
-    
-    # Check if we need to regenerate (force mode or file doesn't exist)
-    echo "DEBUG: force=$force, file exists=$([ -f "$CACHE_FILE" ] && echo "yes" || echo "no")"
-    
-    if [ "$force" = "true" ]; then
-        echo "⚙️  FORCE MODE: Removing existing cache and regenerating..."
-        rm -f "$CACHE_FILE"
-    fi
-    
+
+    # Cache key from absolute path (resolved) + parameters
+    local abs_image
+    abs_image=$(readlink -f "$image")
+    local key_string="${abs_image}|${mode}|${BG_TYPE}|${BLUR_AMOUNT}|${BG_COLOR}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
+    local cache_key
+    cache_key=$(echo -n "$key_string" | md5sum | cut -d' ' -f1)
+    local CACHE_FILE="$CACHE_DIR/${cache_key}.jpg"
+
+    debug_log "force=$force, cache=$CACHE_FILE"
+
     if [ "$force" = "true" ] || [ ! -f "$CACHE_FILE" ]; then
-        echo "⚙️  Processing image (forced: $force)..."
-        
-        # Get image dimensions for info
-        local img_width img_height
-        img_width=$(identify -format "%w" "$image" 2>/dev/null || echo "0")
-        img_height=$(identify -format "%h" "$image" 2>/dev/null || echo "0")
-        
-        echo "📐 Original image: ${img_width}x${img_height}"
-        
-        # Process based on mode
+        echo "⚙️  Processing image..."
+        local img_w img_h
+        img_w=$($IM_IDENTIFY -format "%w" "$image" 2>/dev/null || echo "0")
+        img_h=$($IM_IDENTIFY -format "%h" "$image" 2>/dev/null || echo "0")
+        echo "📐 Original image: ${img_w}x${img_h}"
+
         case "$mode" in
-            "zoom")
-                # Zoom to fill (crops if necessary)
-                convert "$image" \
-                    -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" \
-                    -gravity center \
-                    -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                    -quality 95 \
-                    "$CACHE_FILE"
+            zoom)
+                $IM_CMD "$image" -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -quality 95 "$CACHE_FILE"
                 ;;
-                
-            "fit")
-                # Fit image within area
-                echo "  Creating fit mode..."
-                
+            fit)
                 if [ "$BG_TYPE" = "blur" ]; then
-                    # Blurred background
-                    convert "$image" \
+                    $IM_CMD "$image" \
                         \( -clone 0 -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -blur "0x${BLUR_AMOUNT}" \) \
                         \( -clone 0 -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \) \
-                        -delete 0 \
-                        -gravity center \
-                        -composite \
-                        -quality 95 \
-                        "$CACHE_FILE"
+                        -delete 0 -gravity center -composite -quality 95 "$CACHE_FILE"
                 else
-                    # Solid color background
-                    convert "$image" \
-                        -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                        -background "$BG_COLOR" \
-                        -gravity center \
-                        -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                        -quality 95 \
-                        "$CACHE_FILE"
+                    $IM_CMD "$image" -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -background "$BG_COLOR" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -quality 95 "$CACHE_FILE"
                 fi
                 ;;
-                
-            "center")
-                # Center image on background - SIMPLIFIED LOGIC
-                echo "  Creating center mode..."
-
+            center)
                 if [ "$BG_TYPE" = "blur" ]; then
-                    # Create temporary files securely
-                    blur_bg=$(mktemp) || { echo "❌ Error: Failed to create temp file"; exit 1; }
-                    center_fg=$(mktemp) || { echo "❌ Error: Failed to create temp file"; exit 1; }
-
-                    # Create blurred background (zoomed to fill)
-                    convert "$image" \
-                        -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" \
-                        -gravity center \
-                        -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                        -blur "0x${BLUR_AMOUNT}" \
-                        "$blur_bg"
-        
-                    # Create centered image (max 80% of monitor)
-                    local fit_width fit_height
-                    if [ $img_width -gt $img_height ]; then
-                        fit_width=$((TOTAL_WIDTH * 80 / 100))
-                        fit_height=$((img_height * fit_width / img_width))
+                    local blur_bg=$(mktemp) center_fg=$(mktemp)
+                    $IM_CMD "$image" -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -blur "0x${BLUR_AMOUNT}" "$blur_bg"
+                    local fit_w fit_h
+                    if [ "$img_w" -gt "$img_h" ]; then
+                        fit_w=$((TOTAL_WIDTH * 80 / 100))
+                        fit_h=$((img_h * fit_w / img_w))
                     else
-                        fit_height=$((TOTAL_HEIGHT * 80 / 100))
-                        fit_width=$((img_width * fit_height / img_height))
+                        fit_h=$((TOTAL_HEIGHT * 80 / 100))
+                        fit_w=$((img_w * fit_h / img_h))
                     fi
-
-                    [ $fit_width -gt $TOTAL_WIDTH ] && fit_width=$TOTAL_WIDTH
-                    [ $fit_height -gt $TOTAL_HEIGHT ] && fit_height=$TOTAL_HEIGHT
-
-                    echo "  Centered image size: ${fit_width}x${fit_height}"
-
-                    convert "$image" \
-                        -resize "${fit_width}x${fit_height}" \
-                        "$center_fg"
-
-                    # Composite centered image on blurred background
-                    convert "$blur_bg" \
-                        "$center_fg" \
-                        -gravity center \
-                        -composite \
-                        -quality 95 \
-                        "$CACHE_FILE"
-
-                    # Cleanup temporary files
+                    [ "$fit_w" -gt "$TOTAL_WIDTH" ] && fit_w=$TOTAL_WIDTH
+                    [ "$fit_h" -gt "$TOTAL_HEIGHT" ] && fit_h=$TOTAL_HEIGHT
+                    $IM_CMD "$image" -resize "${fit_w}x${fit_h}" "$center_fg"
+                    $IM_CMD "$blur_bg" "$center_fg" -gravity center -composite -quality 95 "$CACHE_FILE"
                     rm -f "$blur_bg" "$center_fg"
-                    
                 else
-                    # Solid color background - SIMPLE APPROACH
-                    # Create centered image (max 80% of monitor)
-                    local fit_width fit_height
-                    if [ $img_width -gt $img_height ]; then
-                        fit_width=$((TOTAL_WIDTH * 80 / 100))
-                        fit_height=$((img_height * fit_width / img_width))
+                    local fit_w fit_h
+                    if [ "$img_w" -gt "$img_h" ]; then
+                        fit_w=$((TOTAL_WIDTH * 80 / 100))
+                        fit_h=$((img_h * fit_w / img_w))
                     else
-                        fit_height=$((TOTAL_HEIGHT * 80 / 100))
-                        fit_width=$((img_width * fit_height / img_height))
+                        fit_h=$((TOTAL_HEIGHT * 80 / 100))
+                        fit_w=$((img_w * fit_h / img_h))
                     fi
-                    
-                    [ $fit_width -gt $TOTAL_WIDTH ] && fit_width=$TOTAL_WIDTH
-                    [ $fit_height -gt $TOTAL_HEIGHT ] && fit_height=$TOTAL_HEIGHT
-                    
-                    echo "  Centered image size: ${fit_width}x${fit_height}"
-                    
-                    # Simple version without temporary files
-                    convert "$image" \
-                        -resize "${fit_width}x${fit_height}" \
-                        -background "$BG_COLOR" \
-                        -gravity center \
-                        -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" \
-                        -quality 95 \
-                        "$CACHE_FILE"
+                    [ "$fit_w" -gt "$TOTAL_WIDTH" ] && fit_w=$TOTAL_WIDTH
+                    [ "$fit_h" -gt "$TOTAL_HEIGHT" ] && fit_h=$TOTAL_HEIGHT
+                    $IM_CMD "$image" -resize "${fit_w}x${fit_h}" -background "$BG_COLOR" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -quality 95 "$CACHE_FILE"
                 fi
                 ;;
-                
-            *)
-                echo "❌ Error: Unknown mode: $mode. Use: zoom, fit, center"
-                exit 1
-                ;;
+            *) echo "❌ Error: Unknown mode: $mode"; exit 1 ;;
         esac
-        
         [ -f "$CACHE_FILE" ] || { echo "❌ Error: Image processing failed"; exit 1; }
     else
-        echo "⚙️  Using cached image (use force refresh to regenerate)"
-        # Touch the file to update timestamp even when using cache
+        echo "⚙️  Using cached image"
         touch "$CACHE_FILE"
     fi
-    
-    # Save state
+
     echo "$image" > "$STATE_FILE"
     echo "$mode" >> "$STATE_FILE"
     echo "$BG_TYPE" >> "$STATE_FILE"
@@ -440,30 +274,130 @@ set_wallpaper() {
         echo "$BG_COLOR" >> "$STATE_FILE"
     fi
     echo "$(date '+%Y-%m-%d %H:%M:%S')" >> "$STATE_FILE"
-    
-    # Set wallpaper
-    echo "🎯 Applying wallpaper..."
+
     gsettings set org.cinnamon.desktop.background picture-uri "file://$CACHE_FILE"
     gsettings set org.cinnamon.desktop.background picture-options "spanned"
-    
     echo "✅ Wallpaper set successfully!"
 }
 
-# Refresh current wallpaper (reapply to fix blur)
+# ---------- Per-monitor wallpaper (unchanged) ----------
+set_per_monitor_wallpaper() {
+    local images=("$@")
+    local mode="${images[-1]}"
+
+    case "$mode" in
+        zoom|fit|center) unset 'images[-1]' ;;
+        *) mode=$(get_default_mode) ;;
+    esac
+
+    get_monitor_info
+    if [ ${#images[@]} -ne "$MONITOR_COUNT" ]; then
+        echo "❌ Error: You must provide exactly $MONITOR_COUNT image(s)."
+        exit 1
+    fi
+
+    for img in "${images[@]}"; do
+        [ -f "$img" ] || { echo "❌ Error: File not found: $img"; exit 1; }
+    done
+
+    echo "🎨 Setting per‑monitor wallpaper ($MONITOR_COUNT monitors)"
+    echo "📐 Mode: $mode"
+    echo "🎨 Background: $BG_TYPE"
+
+    get_total_span
+    mkdir -p "$CACHE_DIR"
+
+    local key_string="${mode}|${BG_TYPE}|${BLUR_AMOUNT}|${BG_COLOR}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
+    for img in "${images[@]}"; do
+        key_string="${key_string}|$(readlink -f "$img")"
+    done
+    local cache_key
+    cache_key=$(echo -n "$key_string" | md5sum | cut -d' ' -f1)
+    local CACHE_FILE="$CACHE_DIR/${cache_key}.jpg"
+
+    if [ ! -f "$CACHE_FILE" ]; then
+        echo "⚙️  Processing images..."
+        local bg_canvas
+        bg_canvas=$(mktemp) || { echo "❌ Failed to create temp canvas"; exit 1; }
+        if [ "$BG_TYPE" = "blur" ]; then
+            $IM_CMD "${images[0]}" -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -blur "0x${BLUR_AMOUNT}" "$bg_canvas"
+        else
+            $IM_CMD -size "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" "xc:$BG_COLOR" "$bg_canvas"
+        fi
+
+        local i
+        for i in $(seq 0 $((MONITOR_COUNT-1))); do
+            local img="${images[i]}"
+            local mon_w="${MONITOR_W[i]}"
+            local mon_h="${MONITOR_H[i]}"
+            local mon_x="${MONITOR_X[i]}"
+            local mon_y="${MONITOR_Y[i]}"
+
+            local processed
+            processed=$(process_image_for_area "$img" "$mon_w" "$mon_h" "$mode") || exit 1
+
+            local img_w img_h
+            img_w=$($IM_IDENTIFY -format "%w" "$processed")
+            img_h=$($IM_IDENTIFY -format "%h" "$processed")
+
+            if [ "$mode" = "zoom" ]; then
+                $IM_CMD "$bg_canvas" "$processed" -geometry +${mon_x}+${mon_y} -composite "$bg_canvas"
+            else
+                local offset_x=$(( mon_x + (mon_w - img_w) / 2 ))
+                local offset_y=$(( mon_y + (mon_h - img_h) / 2 ))
+                [ "$offset_x" -lt "$mon_x" ] && offset_x="$mon_x"
+                [ "$offset_y" -lt "$mon_y" ] && offset_y="$mon_y"
+                $IM_CMD "$bg_canvas" "$processed" -geometry +${offset_x}+${offset_y} -composite "$bg_canvas"
+            fi
+            rm -f "$processed"
+        done
+
+        $IM_CMD "$bg_canvas" -quality 95 "$CACHE_FILE"
+        rm -f "$bg_canvas"
+    else
+        echo "⚙️  Using cached per‑monitor image"
+        touch "$CACHE_FILE"
+    fi
+
+    local imgs_string
+    imgs_string=$(printf "|%s" "${images[@]}")
+    imgs_string="${imgs_string:1}"
+    echo "per-monitor:$imgs_string" > "$STATE_FILE"
+    echo "$mode" >> "$STATE_FILE"
+    echo "$BG_TYPE" >> "$STATE_FILE"
+    if [ "$BG_TYPE" = "blur" ]; then
+        echo "$BLUR_AMOUNT" >> "$STATE_FILE"
+    else
+        echo "$BG_COLOR" >> "$STATE_FILE"
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S')" >> "$STATE_FILE"
+
+    gsettings set org.cinnamon.desktop.background picture-uri "file://$CACHE_FILE"
+    gsettings set org.cinnamon.desktop.background picture-options "spanned"
+    echo "✅ Per‑monitor wallpaper set successfully!"
+}
+
+# ---------- Refresh / Rotation / Status (with wait calls) ----------
+
 refresh_wallpaper() {
     if [ -f "$STATE_FILE" ]; then
-        local recent_image
-        local recent_mode
-        recent_image=$(head -n1 "$STATE_FILE")
-        recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
-        
-        if [ -f "$recent_image" ]; then
-            echo "🔄 Refreshing wallpaper to prevent blur..."
-            set_wallpaper "$recent_image" "$recent_mode"
-            return 0
+        local recent_line
+        recent_line=$(head -n1 "$STATE_FILE")
+        if [[ "$recent_line" == per-monitor:* ]]; then
+            local imgs="${recent_line#per-monitor:}"
+            IFS='|' read -ra img_array <<< "$imgs"
+            local mode
+            mode=$(sed -n '2p' "$STATE_FILE")
+            set_per_monitor_wallpaper "${img_array[@]}" "$mode"
+            wait
         else
-            echo "⚠️ No valid wallpaper found to refresh"
-            return 1
+            local recent_image="$recent_line"
+            local recent_mode
+            recent_mode=$(sed -n '2p' "$STATE_FILE" || echo "zoom")
+            if [ -f "$recent_image" ]; then
+                set_wallpaper "$recent_image" "$recent_mode" "true"
+                wait
+            fi
         fi
     else
         echo "⚠️ No wallpaper state found"
@@ -471,237 +405,188 @@ refresh_wallpaper() {
     fi
 }
 
-# Start periodic refresh mode
+is_fullscreen_active() {
+    local active_window
+    active_window=$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $5}')
+    [ -n "$active_window" ] || return 1
+    xprop -id "$active_window" _NET_WM_STATE 2>/dev/null | grep -q "_NET_WM_STATE_FULLSCREEN"
+}
+
+monitor_fullscreen() {
+    # unchanged but safe
+    local was_fullscreen=false
+    local refresh_pid=""
+    local random_pid=""
+
+    while true; do
+        sleep 2
+        if [ -f "$REFRESH_FILE" ]; then
+            refresh_pid=$(tail -n1 "$REFRESH_FILE" 2>/dev/null)
+        fi
+        if [ -f "$RANDOM_FILE" ]; then
+            random_pid=$(tail -n1 "$RANDOM_FILE" 2>/dev/null)
+        fi
+
+        if is_fullscreen_active; then
+            if [ "$was_fullscreen" = false ]; then
+                echo "🎬 Full-screen detected - pausing wallpaper services"
+                [ -n "$refresh_pid" ] && kill -STOP "$refresh_pid" 2>/dev/null && echo "   ⏸️  Refresh paused"
+                [ -n "$random_pid" ] && kill -STOP "$random_pid" 2>/dev/null && echo "   ⏸️  Random rotation paused"
+                was_fullscreen=true
+            fi
+        else
+            if [ "$was_fullscreen" = true ]; then
+                echo "🎬 Full-screen ended - resuming wallpaper services"
+                [ -n "$refresh_pid" ] && kill -CONT "$refresh_pid" 2>/dev/null && echo "   ▶️  Refresh resumed"
+                [ -n "$random_pid" ] && kill -CONT "$random_pid" 2>/dev/null && echo "   ▶️  Random rotation resumed"
+                was_fullscreen=false
+            fi
+        fi
+    done
+}
+
+monitor_layout() {
+    local last_layout=""
+    while true; do
+        sleep 2
+        local current_layout
+        current_layout=$(xrandr --listmonitors 2>/dev/null | md5sum | cut -d' ' -f1)
+        if [ -n "$last_layout" ] && [ "$current_layout" != "$last_layout" ]; then
+            echo "🖥️  Display layout changed - reapplying wallpaper..."
+            refresh_wallpaper > /dev/null 2>&1 || true
+            wait
+        fi
+        last_layout="$current_layout"
+    done
+}
+
+# ========== ROBUST STOP FUNCTION ==========
+stop_refresh_mode() {
+    local mypid=$$
+    # Kill ALL refresh-start processes (parent, child, monitors) except this script itself
+    for pid in $(pgrep -f "ultraspan refresh-start" 2>/dev/null); do
+        [ "$pid" != "$mypid" ] && kill "$pid" 2>/dev/null
+    done
+    rm -f "$REFRESH_FILE" "$FULLSCREEN_FILE" "$LAYOUT_MONITOR_PIDFILE"
+    echo "⏹️ Periodic refresh stopped"
+}
+
 start_refresh_mode() {
-    local interval="${1:-180}"  # Default to 3 hours if not specified
-    
-    # Validate interval
-    if [[ ! "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
-        echo "❌ Error: Interval must be a positive number (minutes)"
-        exit 1
-    fi
-    
-    echo "🔄 Starting periodic wallpaper refresh every $interval minutes"
-    echo "   This will reapply the current wallpaper to prevent blurring"
-    
-    # Save refresh settings
+    local interval="${1:-180}"
+    [[ "$interval" =~ ^[0-9]+$ ]] || { echo "❌ Error: Interval must be a positive number (minutes)"; exit 1; }
+
+    # Stop any previous refresh instances first
+    stop_refresh_mode
+    # Small pause to ensure all children terminate
+    sleep 0.5
+    # Final check: if any other refresh-start is still alive (excluding us), abort
+    local mypid=$$
+    for pid in $(pgrep -f "ultraspan refresh-start" 2>/dev/null); do
+        if [ "$pid" != "$mypid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "❌ Failed to stop old refresh processes. Please try again."
+            exit 1
+        fi
+    done
+
     mkdir -p "$CONFIG_DIR"
     echo "interval=$interval" > "$REFRESH_FILE"
     echo "pid=$$" >> "$REFRESH_FILE"
-    
-    # Function to refresh wallpaper (FORCED VERSION)
+
     do_refresh() {
         while true; do
             sleep $((interval * 60))
-            
-            # Check if still running
-            [ ! -f "$REFRESH_FILE" ] && exit 0
-            
-            # Check if there's a current wallpaper to refresh
+            [ -f "$REFRESH_FILE" ] || exit 0
             if [ -f "$STATE_FILE" ]; then
-                local recent_image
-                local recent_mode
-                recent_image=$(head -n1 "$STATE_FILE")
-                recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
-                
-                if [ -f "$recent_image" ]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - 🔄 Auto-refreshing wallpaper: $(basename "$recent_image")"
-                    
-                    # Force regeneration by passing "true" as third parameter
-                    "$0" set "$recent_image" "$recent_mode" "true" > /tmp/ultraspan-debug.log 2>&1
-                fi
+                echo "$(date) - 🔄 Auto-refreshing wallpaper"
+                refresh_wallpaper
+                wait
             fi
         done
     }
-    
-    # Start refresh process in background
+
     do_refresh &
     local refresh_pid=$!
     echo $refresh_pid >> "$REFRESH_FILE"
-    
-    # Start fullscreen monitor if enabled
+
     if [ "$FULLSCREEN_PAUSE" = "true" ]; then
         monitor_fullscreen &
-        local monitor_pid=$!
-        echo "$monitor_pid" >> "$FULLSCREEN_FILE"
+        echo $! > "$FULLSCREEN_FILE"
     fi
-    
-        # Start layout monitor if not already running
-    if [ ! -f "$CONFIG_DIR/layout_monitor.pid" ]; then
+
+    if [ ! -f "$LAYOUT_MONITOR_PIDFILE" ]; then
         monitor_layout &
-        echo $! > "$CONFIG_DIR/layout_monitor.pid"
+        echo $! > "$LAYOUT_MONITOR_PIDFILE"
     fi
-    
+
     echo "✅ Periodic refresh started (PID: $refresh_pid)"
     disown
 }
 
-# Stop periodic refresh
-stop_refresh_mode() {
-    if [ -f "$REFRESH_FILE" ]; then
-        # Get PID from file (last line)
-        local pid
-        pid=$(tail -n1 "$REFRESH_FILE" 2>/dev/null)
-        
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            echo "⏹️ Periodic refresh stopped"
-        else
-            echo "⚠️ Periodic refresh not running"
-        fi
-        
-        rm -f "$REFRESH_FILE"
-    else
-        echo "⚠️ Periodic refresh not active"
-    fi
-    
-    # Kill fullscreen monitor if running
-    if [ -f "$FULLSCREEN_FILE" ]; then
-        local monitor_pid
-        monitor_pid=$(cat "$FULLSCREEN_FILE" 2>/dev/null)
-        if [ -n "$monitor_pid" ] && kill -0 "$monitor_pid" 2>/dev/null; then
-            kill "$monitor_pid" 2>/dev/null || true
-        fi
-        rm -f "$FULLSCREEN_FILE"
-    fi
-    
-    # Kill layout monitor
-    if [ -f "$CONFIG_DIR/layout_monitor.pid" ]; then
-        local layout_pid
-        layout_pid=$(cat "$CONFIG_DIR/layout_monitor.pid")
-        kill "$layout_pid" 2>/dev/null || true
-        rm -f "$CONFIG_DIR/layout_monitor.pid"
-    fi
-}
-
-# Show refresh status (FIXED VERSION)
 show_refresh_status() {
     if [ -f "$REFRESH_FILE" ]; then
-        echo "=== Periodic Refresh Status ==="
-        echo ""
-        
-        # Read settings
-        local INTERVAL=""
-        local PID=""
-        while IFS='=' read -r key value; do
-            case "$key" in
-                "interval") INTERVAL="$value" ;;
-                "pid") PID="$value" ;;
-            esac
-        done < <(head -n 2 "$REFRESH_FILE")  # Only read first two lines
-        
-        # Also check if there's a PID on line 3 (the child process)
-        local CHILD_PID
-        CHILD_PID=$(sed -n '3p' "$REFRESH_FILE" 2>/dev/null)
-        
-        echo "⏰ Interval: $INTERVAL minutes"
-        
-        # Check if either PID is running
-        local RUNNING_PID=""
-        if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
-            RUNNING_PID="$CHILD_PID"
-        elif [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            RUNNING_PID="$PID"
-        fi
-        
-        if [ -n "$RUNNING_PID" ]; then
-            echo "Status: Running (PID: $RUNNING_PID)"
-            
-            # Next refresh time
-            local next_time
-            next_time=$(date -d "+$INTERVAL minutes" '+%H:%M:%S')
-            echo "⏱️ Next refresh: ~$next_time"
-            
-            # Last refresh time (from state file)
-            if [ -f "$STATE_FILE" ]; then
-                local last_time
-                last_time=$(tail -n1 "$STATE_FILE" 2>/dev/null)
-                echo "🕐 Last refresh: $last_time"
-            fi
+        local interval pid child_pid
+        interval=$(head -n1 "$REFRESH_FILE" | cut -d= -f2)
+        pid=$(sed -n '2p' "$REFRESH_FILE" | cut -d= -f2)
+        child_pid=$(sed -n '3p' "$REFRESH_FILE")
+        local running_pid=""
+        [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null && running_pid="$child_pid"
+        [ -z "$running_pid" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && running_pid="$pid"
+        echo "⏰ Interval: $interval minutes"
+        if [ -n "$running_pid" ]; then
+            echo "Status: Running (PID: $running_pid)"
+            echo "⏱️ Next refresh: ~$(date -d "+$interval minutes" '+%H:%M:%S')"
         else
-            echo "🔴 Status: Not running (stale config)"
+            echo "🔴 Status: Not running"
         fi
     else
         echo "ℹ️ Periodic refresh is not active"
     fi
 }
 
-# Random wallpaper functions
 start_random_mode() {
     local directory="$1"
     local mode="${2:-zoom}"
     local interval="${RANDOM_INTERVAL:-30}"
-    
-    [ -d "$directory" ] || { echo "❌ Error: Directory not found: $directory"; exit 1; }
-    
-    # Get list of image files
+    [ -d "$directory" ] || { echo "❌ Error: Directory not found"; exit 1; }
     local images=()
     while IFS= read -r -d $'\0' file; do
         images+=("$file")
     done < <(find "$directory" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.webp" \) -print0)
-    
-    [ ${#images[@]} -eq 0 ] && { echo "❌ Error: No image files found in $directory"; exit 1; }
-    
-    echo "📁 Found ${#images[@]} images in $directory"
-    echo "⏰ Interval: $interval minutes"
-    echo "📐 Mode: $mode"
-    
-    # Save random mode settings
+    [ ${#images[@]} -eq 0 ] && { echo "❌ No images found"; exit 1; }
+    echo "📁 Found ${#images[@]} images"
     mkdir -p "$CONFIG_DIR"
     echo "directory=$directory" > "$RANDOM_FILE"
     echo "mode=$mode" >> "$RANDOM_FILE"
     echo "interval=$interval" >> "$RANDOM_FILE"
     echo "pid=$$" >> "$RANDOM_FILE"
-    
-    echo "🔄 Random rotation started. Press Ctrl+C to stop."
-    
-    # Function to pick random image
-    pick_random_image() {
-        local random_index=$((RANDOM % ${#images[@]}))
-        echo "${images[$random_index]}"
-    }
-    
-    # Set first wallpaper
+
+    pick_random_image() { echo "${images[$((RANDOM % ${#images[@]}))]}"; }
+
     local first_image
     first_image=$(pick_random_image)
-    echo "🎲 First random image: $(basename "$first_image")"
     set_wallpaper "$first_image" "$mode"
-    
-    # Continue in background
+    wait
+
     (
         exec 9>&-
         while true; do
             sleep $((interval * 60))
-            
-            # Check if still running
-            [ ! -f "$RANDOM_FILE" ] && exit 0
-            
-            # Pick new random image
-            local new_image
-            new_image=$(pick_random_image)
-            echo "🔄 Rotating to: $(basename "$new_image")"
-            set_wallpaper "$new_image" "$mode" 2>/dev/null || true
+            [ -f "$RANDOM_FILE" ] || exit 0
+            local new_img
+            new_img=$(pick_random_image)
+            set_wallpaper "$new_img" "$mode"
+            wait
         done
     ) &
-    
     echo $! >> "$RANDOM_FILE"
     disown
 }
 
 stop_random_mode() {
     if [ -f "$RANDOM_FILE" ]; then
-        # Get PID from file (last line)
-        local pid
-        pid=$(tail -n1 "$RANDOM_FILE" 2>/dev/null)
-        
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            echo "⏹️ Random rotation stopped"
-        else
-            echo "⚠️ Random rotation not running"
-        fi
-        
+        kill "$(tail -n1 "$RANDOM_FILE")" 2>/dev/null
         rm -f "$RANDOM_FILE"
+        echo "⏹️ Random rotation stopped"
     else
         echo "⚠️ Random rotation not active"
     fi
@@ -709,38 +594,25 @@ stop_random_mode() {
 
 show_random_status() {
     if [ -f "$RANDOM_FILE" ]; then
-        echo "=== Random Rotation Status ==="
-        echo ""
-        
-        # Read settings
+        local dir mode interval pid
         while IFS='=' read -r key value; do
             case "$key" in
-                "directory") DIRECTORY="$value" ;;
-                "mode") RANDOM_MODE="$value" ;;
-                "interval") INTERVAL="$value" ;;
-                "pid") PID="$value" ;;
+                directory) dir="$value";;
+                mode) mode="$value";;
+                interval) interval="$value";;
+                pid) pid="$value";;
             esac
         done < "$RANDOM_FILE"
-        
-        echo "📁 Directory: $DIRECTORY"
-        echo "📐 Mode: $RANDOM_MODE"
-        echo "⏰ Interval: $INTERVAL minutes"
-        
-        # Check if process is running
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            echo "🟢 Status: Running (PID: $PID)"
-            
-            # Count images
+        echo "📁 Directory: $dir"
+        echo "📐 Mode: $mode"
+        echo "⏰ Interval: $interval minutes"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "🟢 Running (PID: $pid)"
             local count
-            count=$(find "$DIRECTORY" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.webp" \) | wc -l)
+            count=$(find "$dir" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.webp" \) | wc -l)
             echo "📊 Images available: $count"
-            
-            # Next rotation time
-            local next_time
-            next_time=$(date -d "+$INTERVAL minutes" '+%H:%M')
-            echo "⏱️ Next rotation: ~$next_time"
         else
-            echo "🔴 Status: Not running (stale config)"
+            echo "🔴 Not running"
         fi
     else
         echo "ℹ️ Random rotation is not active"
@@ -749,651 +621,219 @@ show_random_status() {
 
 set_interval() {
     local interval="$1"
-    
-    # Validate interval
-    if [[ ! "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
-        echo "❌ Error: Interval must be a positive number (minutes)"
-        exit 1
-    fi
-    
-    # Update config
+    [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 1 ] || { echo "❌ Invalid interval"; exit 1; }
     RANDOM_INTERVAL="$interval"
     update_config "random_interval" "$interval"
-    
-    echo "✅ Random rotation interval set to: $interval minutes"
-    
-    # Update running random mode if active
+    echo "✅ Interval set to $interval minutes"
     if [ -f "$RANDOM_FILE" ]; then
-        # Save directory and mode BEFORE stopping
-        local random_dir random_mode
+        local dir mode
         while IFS='=' read -r key value; do
             case "$key" in
-                "directory") random_dir="$value" ;;
-                "mode") random_mode="$value" ;;
+                directory) dir="$value";;
+                mode) mode="$value";;
             esac
         done < "$RANDOM_FILE"
-        
-        echo "🔄 Updating running random rotation..."
         stop_random_mode
-        
-        # Restart with saved values
-        if [ -n "$random_dir" ] && [ -d "$random_dir" ]; then
-            start_random_mode "$random_dir" "$random_mode"
-        fi
+        [ -n "$dir" ] && start_random_mode "$dir" "$mode"
     fi
 }
 
-# Show status
 show_status() {
     load_config
-    
     echo "=== Ultraspan Status ==="
-    echo ""
-    
-    # Current wallpaper
     local current_uri
-    current_uri=$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null | sed "s/'//g" || echo "Unable to get")
-    echo "📷 Current Wallpaper:"
-    echo "   $current_uri"
-    echo ""
-    
-    # Monitor info
-    local XRANDR_OUT
-    XRANDR_OUT=$(xrandr --listmonitors 2>/dev/null)
-    local MIN_X=99999 MIN_Y=99999 MAX_X=0 MAX_Y=0
-    while IFS= read -r line; do
-        if [[ $line =~ ([0-9]+:[[:space:]]+[\+\*]*)([A-Za-z0-9-]+)[[:space:]]+([0-9]+)\/[0-9]+x([0-9]+)\/[0-9]+\+([0-9]+)\+([0-9]+) ]]; then
-            local W="${BASH_REMATCH[3]}" H="${BASH_REMATCH[4]}" X="${BASH_REMATCH[5]}" Y="${BASH_REMATCH[6]}"
-            [ $X -lt $MIN_X ] && MIN_X=$X
-            [ $Y -lt $MIN_Y ] && MIN_Y=$Y
-            local X2=$((X + W))
-            local Y2=$((Y + H))
-            [ $X2 -gt $MAX_X ] && MAX_X=$X2
-            [ $Y2 -gt $MAX_Y ] && MAX_Y=$Y2
-        fi
-    done <<< "$XRANDR_OUT"
-    
-    echo "🖥️  Monitor Layout:"
-    echo "   Total span: $((MAX_X - MIN_X))x$((MAX_Y - MIN_Y))"
-    echo ""
-    
-    # Settings
-    echo "⚙️  Settings:"
-    echo "   Mode: ${MODE:-zoom}"
-    echo "   Background type: ${BG_TYPE:-blur}"
-    if [ "${BG_TYPE:-blur}" = "blur" ]; then
-        echo "   Blur amount: ${BLUR_AMOUNT:-15}"
-    else
-        echo "   Color: ${BG_COLOR:-#000000}"
-    fi
-    
-    # Random rotation status
-    if [ -f "$RANDOM_FILE" ]; then
-        echo ""
-        echo "🎲 Random Rotation: Active"
-        while IFS='=' read -r key value; do
-            case "$key" in
-                "directory") echo "   Directory: $value" ;;
-                "mode") echo "   Mode: $value" ;;
-                "interval") echo "   Interval: $value minutes" ;;
-            esac
-        done < "$RANDOM_FILE"
-    fi
-    
-    # Refresh status
-    if [ -f "$REFRESH_FILE" ]; then
-        echo ""
-        echo "🔄 Periodic Refresh: Active"
-        while IFS='=' read -r key value; do
-            case "$key" in
-                "interval") echo "   Interval: $value minutes" ;;
-            esac
-        done < "$REFRESH_FILE"
-    fi
-    echo ""
-    
-    # Cache info
+    current_uri=$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null | sed "s/'//g")
+    echo "📷 Current Wallpaper: $current_uri"
+    get_total_span
+    echo "🖥️  Monitor span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
+    echo "⚙️  Mode: $MODE, Background: $BG_TYPE"
+    if [ "$BG_TYPE" = "blur" ]; then echo "   Blur: $BLUR_AMOUNT"; else echo "   Color: $BG_COLOR"; fi
+    [ -f "$RANDOM_FILE" ] && echo "🎲 Random rotation active"
+    [ -f "$REFRESH_FILE" ] && echo "🔄 Periodic refresh active"
     if [ -d "$CACHE_DIR" ]; then
-        local cache_size cache_count
-        cache_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1 || echo "0")
-        cache_count=$(find "$CACHE_DIR" -name "*.jpg" 2>/dev/null | wc -l || echo "0")
-        echo "🗃️  Cache:"
-        echo "   Files: $cache_count"
-        echo "   Size: $cache_size"
-        echo ""
-    fi
-    
-    # Recent wallpaper from state
-    if [ -f "$STATE_FILE" ]; then
-        local recent_image
-        recent_image=$(head -n1 "$STATE_FILE")
-        if [ -f "$recent_image" ]; then
-            echo "📝 Recent Wallpaper:"
-            echo "   $recent_image"
-            local recent_mode
-            recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
-            if [ -n "$recent_mode" ]; then
-                echo "   Mode: $recent_mode"
-                local recent_bg_type
-                recent_bg_type=$(sed -n '3p' "$STATE_FILE" 2>/dev/null)
-                echo "   Background: $recent_bg_type"
-                if [ "$recent_bg_type" = "blur" ]; then
-                    echo "   Blur: $(sed -n '4p' "$STATE_FILE" 2>/dev/null)"
-                else
-                    echo "   Color: $(sed -n '4p' "$STATE_FILE" 2>/dev/null)"
-                fi
-            fi
-        fi
+        local count size
+        count=$(find "$CACHE_DIR" -name "*.jpg" | wc -l)
+        size=$(du -sh "$CACHE_DIR" | cut -f1)
+        echo "🗃️  Cache: $count files, $size"
     fi
 }
 
-# Show image info
 show_image_info() {
     local image="$1"
-    
-    [ -f "$image" ] || { echo "❌ Error: File not found: $image"; exit 1; }
-    
-    echo "=== Image Information ==="
-    echo ""
-    
-    echo "📄 File: $(basename "$image")"
-    echo "📁 Path: $image"
-    echo "📏 Size: $(du -h "$image" 2>/dev/null | cut -f1 || echo "Unknown")"
-    echo ""
-    
-    # Image dimensions
-    local img_width img_height
-    img_width=$(identify -format "%w" "$image" 2>/dev/null || echo "Unknown")
-    img_height=$(identify -format "%h" "$image" 2>/dev/null || echo "Unknown")
-    
-    echo "🖼️  Dimensions: ${img_width}x${img_height}"
-    echo ""
-    
-    # Get monitor span
-    local XRANDR_OUT
-    XRANDR_OUT=$(xrandr --listmonitors 2>/dev/null)
-    local MIN_X=99999 MIN_Y=99999 MAX_X=0 MAX_Y=0
-    while IFS= read -r line; do
-        if [[ $line =~ ([0-9]+:[[:space:]]+[\+\*]*)([A-Za-z0-9-]+)[[:space:]]+([0-9]+)\/[0-9]+x([0-9]+)\/[0-9]+\+([0-9]+)\+([0-9]+) ]]; then
-            local W="${BASH_REMATCH[3]}" H="${BASH_REMATCH[4]}" X="${BASH_REMATCH[5]}" Y="${BASH_REMATCH[6]}"
-            [ $X -lt $MIN_X ] && MIN_X=$X
-            [ $Y -lt $MIN_Y ] && MIN_Y=$Y
-            local X2=$((X + W))
-            local Y2=$((Y + H))
-            [ $X2 -gt $MAX_X ] && MAX_X=$X2
-            [ $Y2 -gt $MAX_Y ] && MAX_Y=$Y2
-        fi
-    done <<< "$XRANDR_OUT"
-    
-    local total_width=$((MAX_X - MIN_X))
-    local total_height=$((MAX_Y - MIN_Y))
-    
-    echo "📐 Target Monitor Span: ${total_width}x${total_height}"
+    [ -f "$image" ] || { echo "❌ Error: File not found"; exit 1; }
+    echo "📄 $(basename "$image")"
+    echo "📏 $(du -h "$image" | cut -f1)"
+    local w h
+    w=$($IM_IDENTIFY -format "%w" "$image" 2>/dev/null || echo "Unknown")
+    h=$($IM_IDENTIFY -format "%h" "$image" 2>/dev/null || echo "Unknown")
+    echo "🖼️  ${w}x${h}"
+    get_total_span
+    echo "📐 Target span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
 }
 
-# List recent wallpapers
-list_recent() {
-    echo "=== Recent Wallpapers ==="
-    echo ""
-    
-    if [ -f "$STATE_FILE" ]; then
-        local recent_image
-        recent_image=$(head -n1 "$STATE_FILE")
-        if [ -f "$recent_image" ]; then
-            echo "📌 Current: $recent_image"
-            local recent_mode
-            recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
-            if [ -n "$recent_mode" ]; then
-                echo "   Mode: $recent_mode"
-                local recent_bg_type
-                recent_bg_type=$(sed -n '3p' "$STATE_FILE" 2>/dev/null)
-                echo "   Background: $recent_bg_type"
-                if [ "$recent_bg_type" = "blur" ]; then
-                    echo "   Blur: $(sed -n '4p' "$STATE_FILE" 2>/dev/null)"
-                else
-                    echo "   Color: $(sed -n '4p' "$STATE_FILE" 2>/dev/null)"
-                fi
-            fi
-        fi
-    fi
-    
-    # Check cache for recent files
-    if [ -d "$CACHE_DIR" ]; then
-        echo ""
-        echo "🗃️  Cached Wallpapers:"
-        find "$CACHE_DIR" -name "*.jpg" -type f -exec ls -lt {} + 2>/dev/null | \
-            head -5 | \
-            while read -r line; do
-                local file date size
-                file=$(echo "$line" | awk '{print $9}')
-                date=$(echo "$line" | awk '{print $6, $7, $8}')
-                size=$(du -h "$file" 2>/dev/null | cut -f1)
-                echo "   $(basename "$file") - $size - $date"
-            done || true
-    fi
-}
+list_recent() { show_status; }
 
-# Set mode
 set_mode() {
-    local mode="$1"
-    
-    case "$mode" in
-        "zoom"|"fit"|"center")
-            MODE="$mode"
-            update_config "mode" "$MODE"
-            update_config "bg_type" "$BG_TYPE"
-            if [ "$BG_TYPE" = "blur" ]; then
-                update_config "blur" "$BLUR_AMOUNT"
-            else
-                update_config "color" "$BG_COLOR"
-            fi
-            echo "✅ Default mode set to: $mode"
-            
-            # If there's a recent wallpaper, reapply it with new mode
-            if [ -f "$STATE_FILE" ]; then
-                local recent_image
-                recent_image=$(head -n1 "$STATE_FILE")
-                if [ -f "$recent_image" ]; then
-                    echo "🔄 Reapplying current wallpaper with new mode..."
-                    set_wallpaper "$recent_image" "$mode"
-                fi
-            fi
-            ;;
-        *)
-            echo "❌ Error: Invalid mode: $mode"
-            echo "   Valid modes: zoom, fit, center"
-            exit 1
-            ;;
-    esac
+    case "$1" in zoom|fit|center) ;; *) echo "❌ Invalid mode"; exit 1 ;; esac
+    MODE="$1"
+    update_config "mode" "$MODE"
+    echo "✅ Default mode: $MODE"
+    [ -f "$STATE_FILE" ] && refresh_wallpaper
 }
 
-# Set background type
 set_bg_type() {
-    local bg_type="$1"
-    
-    case "$bg_type" in
-        "blur"|"solid")
-            BG_TYPE="$bg_type"
-            update_config "mode" "${MODE:-zoom}"
-            update_config "bg_type" "$BG_TYPE"
-            if [ "$BG_TYPE" = "blur" ]; then
-                update_config "blur" "$BLUR_AMOUNT"
-            else
-                update_config "color" "$BG_COLOR"
-            fi
-            echo "✅ Background type set to: $BG_TYPE"
-            
-            # If there's a recent wallpaper, reapply it with new background type
-            if [ -f "$STATE_FILE" ]; then
-                local recent_image
-                recent_image=$(head -n1 "$STATE_FILE")
-                local recent_mode
-                recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
-                if [ -f "$recent_image" ] && [ "$recent_mode" != "zoom" ]; then
-                    echo "🔄 Reapplying current wallpaper with new background type..."
-                    set_wallpaper "$recent_image" "$recent_mode"
-                fi
-            fi
-            ;;
-        *)
-            echo "❌ Error: Invalid background type: $bg_type"
-            echo "   Valid types: blur, solid"
-            exit 1
-            ;;
-    esac
-}
-
-# Set blur amount
-set_blur() {
-    local blur_amount="$1"
-    
-    # Validate blur amount
-    if [[ ! "$blur_amount" =~ ^[0-9]+$ ]] || [ "$blur_amount" -lt 0 ] || [ "$blur_amount" -gt 100 ]; then
-        echo "❌ Error: Blur amount must be between 0 and 100"
-        exit 1
-    fi
-    
-    BLUR_AMOUNT="$blur_amount"
-    update_config "mode" "${MODE:-zoom}"
+    case "$1" in blur|solid) ;; *) echo "❌ Invalid bg-type"; exit 1 ;; esac
+    BG_TYPE="$1"
     update_config "bg_type" "$BG_TYPE"
-    update_config "blur" "$BLUR_AMOUNT"
-    echo "✅ Blur amount set to: $BLUR_AMOUNT"
-    
-    # If there's a recent wallpaper, reapply it with new blur
-    if [ -f "$STATE_FILE" ]; then
-        local recent_image
-        recent_image=$(head -n1 "$STATE_FILE")
-        local recent_mode
-        recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
-        if [ -f "$recent_image" ] && [ "$recent_mode" != "zoom" ] && [ "$BG_TYPE" = "blur" ]; then
-            echo "🔄 Reapplying current wallpaper with new blur amount..."
-            set_wallpaper "$recent_image" "$recent_mode"
-        fi
-    fi
+    echo "✅ Background type: $BG_TYPE"
+    [ -f "$STATE_FILE" ] && refresh_wallpaper
 }
 
-# Set solid color
+set_blur() {
+    local amt="$1"
+    [[ "$amt" =~ ^[0-9]+$ ]] && [ "$amt" -ge 0 ] && [ "$amt" -le 100 ] || { echo "❌ Blur must be 0-100"; exit 1; }
+    BLUR_AMOUNT="$amt"
+    update_config "blur" "$BLUR_AMOUNT"
+    echo "✅ Blur: $BLUR_AMOUNT"
+    [ -f "$STATE_FILE" ] && [ "$BG_TYPE" = "blur" ] && refresh_wallpaper
+}
+
 set_color() {
     local color="$1"
-    
-    # If color is empty, the # was interpreted as a comment
-    if [ -z "$color" ]; then
-        echo "❌ Error: When using # format, you must use quotes:"
-        echo "   ultraspan color \"#1a1a1a\""
-        echo "   or use without #: ultraspan color 1a1a1a"
-        exit 1
-    fi
-    
-    # Remove surrounding quotes if present
-    color="${color%\"}"
-    color="${color#\"}"
-    
-    # Remove # for validation
-    local color_clean="${color#\#}"
-    
-    # Validate (6 hex chars)
-    if [[ ! "$color_clean" =~ ^[0-9A-Fa-f]{6}$ ]]; then
-        echo "❌ Error: Invalid color format"
-        echo "   Use: 1a1a1a or \"#1a1a1a\""
-        exit 1
-    fi
-    
-    # Always store with # (consistent format in config)
-    BG_COLOR="#$color_clean"
-    
-    update_config "mode" "${MODE:-zoom}"
-    update_config "bg_type" "$BG_TYPE"
+    color="${color#\#}"
+    [[ "$color" =~ ^[0-9A-Fa-f]{6}$ ]] || { echo "❌ Invalid hex color"; exit 1; }
+    BG_COLOR="#$color"
     update_config "color" "$BG_COLOR"
-    echo "✅ Solid color set to: $BG_COLOR"
-    
-    # Reapply wallpaper if needed
-    if [ -f "$STATE_FILE" ]; then
-        local recent_image
-        recent_image=$(head -n1 "$STATE_FILE")
-        local recent_mode
-        recent_mode=$(sed -n '2p' "$STATE_FILE" 2>/dev/null || echo "zoom")
-        if [ -f "$recent_image" ] && [ "$recent_mode" != "zoom" ] && [ "$BG_TYPE" = "solid" ]; then
-            echo "🔄 Reapplying current wallpaper with new color..."
-            set_wallpaper "$recent_image" "$recent_mode"
-        fi
-    fi
+    echo "✅ Color: $BG_COLOR"
+    [ -f "$STATE_FILE" ] && [ "$BG_TYPE" = "solid" ] && refresh_wallpaper
 }
 
-# Toggle fullscreen pause
 set_fullscreen_pause() {
     local setting="$1"
-    
     case "$setting" in
-        "on"|"true"|"1")
-            FULLSCREEN_PAUSE="true"
-            update_config "fullscreen_pause" "true"
-            echo "✅ Full-screen pause ENABLED - wallpaper services will pause during fullscreen apps"
-            ;;
-        "off"|"false"|"0")
-            FULLSCREEN_PAUSE="false"
-            update_config "fullscreen_pause" "false"
-            echo "✅ Full-screen pause DISABLED - wallpaper services run normally during fullscreen apps"
-            ;;
-        *)
-            echo "📺 Full-screen pause is currently: $FULLSCREEN_PAUSE"
-            echo "   Usage: ultraspan fullscreen [on|off]"
-            ;;
+        on|true|1) FULLSCREEN_PAUSE="true" ;;
+        off|false|0) FULLSCREEN_PAUSE="false" ;;
+        *) echo "📺 Fullscreen pause: $FULLSCREEN_PAUSE"; return ;;
     esac
+    update_config "fullscreen_pause" "$FULLSCREEN_PAUSE"
+    echo "✅ Fullscreen pause: $FULLSCREEN_PAUSE"
+    if [ -f "$REFRESH_FILE" ]; then
+        local interval
+        interval=$(head -n1 "$REFRESH_FILE" | cut -d= -f2)
+        stop_refresh_mode
+        start_refresh_mode "$interval"
+    fi
 }
 
-# Clean cache
 clean_cache() {
-    echo "🧹 Cleaning wallpaper cache..."
-    
+    echo "🧹 Cleaning cache..."
     if [ -d "$CACHE_DIR" ]; then
-        local cache_size cache_count
-        cache_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1 || echo "0")
-        cache_count=$(find "$CACHE_DIR" -name "*.jpg" 2>/dev/null | wc -l || echo "0")
-        
+        local count size
+        count=$(find "$CACHE_DIR" -name "*.jpg" | wc -l)
+        size=$(du -sh "$CACHE_DIR" | cut -f1)
         rm -rf "$CACHE_DIR"
         mkdir -p "$CACHE_DIR"
-        
-        echo "✅ Cache cleaned: removed $cache_count files ($cache_size)"
-    else
-        echo "ℹ️  Cache directory does not exist"
+        echo "✅ Removed $count files ($size)"
     fi
 }
 
-# Restore default
 restore_default() {
-    echo "🔄 Restoring default wallpaper..."
-    
-    local default_wallpaper="/usr/share/backgrounds/linuxmint/default_background.jpg"
-    
-    if [ -f "$default_wallpaper" ]; then
-        set_wallpaper "$default_wallpaper" "zoom"
+    local default_wp="/usr/share/backgrounds/linuxmint/default_background.jpg"
+    if [ -f "$default_wp" ]; then
+        set_wallpaper "$default_wp" "zoom"
     else
-        echo "❌ Error: Default wallpaper not found at: $default_wallpaper"
-        
-        # Try other common locations
-        local alternatives=(
-            "/usr/share/backgrounds"
-            "/usr/share/wallpapers"
-            "/usr/share/gnome-background-properties"
-        )
-        
-        for dir in "${alternatives[@]}"; do
-            if [ -d "$dir" ]; then
-                local first_wallpaper
-                first_wallpaper=$(find "$dir" -name "*.jpg" -o -name "*.png" | head -1)
-                if [ -n "$first_wallpaper" ]; then
-                    set_wallpaper "$first_wallpaper" "zoom"
-                    return 0
-                fi
-            fi
-        done
-        
-        echo "❌ Could not find any system wallpaper"
+        local alt
+        alt=$(find /usr/share/backgrounds /usr/share/wallpapers -name "*.jpg" -o -name "*.png" | head -1)
+        [ -n "$alt" ] && set_wallpaper "$alt" "zoom" || echo "❌ No system wallpaper found"
     fi
 }
 
-# -----------------------------
-# DEPENDENCY CHECK
-# -----------------------------
+# ---------- DEPENDENCY CHECK ----------
 check_dependencies() {
     local missing=()
-    for cmd in convert identify xrandr gsettings sha1sum bc; do
-        if ! command -v "$cmd" &>/dev/null; then
-            missing+=("$cmd")
-        fi
+    for cmd in xrandr gsettings md5sum bc; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [ ${#missing[@]} -ne 0 ]; then
-        echo "❌ Error: Missing required dependencies: ${missing[*]}" >&2
-        echo "   Please install them using your package manager." >&2
-        echo "   For example: sudo apt install imagemagick x11-utils bc" >&2
+        echo "❌ Missing: ${missing[*]}"
+        echo "   Install with: sudo apt install imagemagick x11-utils bc"
+        exit 1
+    fi
+    if ! command -v "$IM_CMD" &>/dev/null; then
+        echo "❌ ImageMagick not found (tried $IM_CMD)."
         exit 1
     fi
 }
 
-# -----------------------------
-# MAIN COMMAND DISPATCHER
-# -----------------------------
-
-# Load config first
+# ---------- MAIN DISPATCHER ----------
 load_config
+check_dependencies
 
-# Also load random interval if exists
-if [ -f "$CONFIG_FILE" ]; then
-    while IFS='=' read -r key value; do
-        case "$key" in
-            "random_interval") RANDOM_INTERVAL="$value" ;;
-        esac
-    done < "$CONFIG_FILE"
-fi
-
-# Get the command
 COMMAND="${1:-help}"
-
 case "$COMMAND" in
-    "set")
-        if [ -z "${2:-}" ]; then
-            echo "❌ Error: No image specified"
-            echo "   Usage: ultraspan set IMAGE_PATH [MODE] [true/false]"
-            exit 1
-        fi
-        
-        # Get default mode from config
+    set)
+        [ -z "${2:-}" ] && { echo "❌ Usage: ultraspan set IMAGE [MODE] [force]"; exit 1; }
         DEFAULT_MODE=$(get_default_mode)
-        
-        # Set mode (3rd argument or default)
         MODE_TO_USE="${3:-$DEFAULT_MODE}"
-        
-        # Set force flag (4th argument, default to false)
-        FORCE_FLAG="false"
-        if [ "${4:-}" = "true" ]; then
-            FORCE_FLAG="true"
-        fi
-        
-        # Call set_wallpaper with all parameters
+        FORCE_FLAG=false
+        [ "${4:-}" = "true" ] && FORCE_FLAG=true
         set_wallpaper "$2" "$MODE_TO_USE" "$FORCE_FLAG"
         ;;
-        
-    "random-stop")
-        stop_random_mode
+    set-per-monitor)
+        [ -z "${2:-}" ] && { echo "❌ Usage: ultraspan set-per-monitor IMG1 IMG2 ... [MODE]"; exit 1; }
+        shift
+        set_per_monitor_wallpaper "$@"
         ;;
-        
-    "random-status")
-        show_random_status
-        ;;
-
-    "random")
-        if [ -z "${2:-}" ]; then
-            echo "❌ Error: No directory specified"
-            echo "   Usage: ultraspan random DIRECTORY [MODE]"
-            echo "   Example: ultraspan random ~/Pictures/Wallpapers zoom"
-            exit 1
-        fi
-        
-        # Stop any existing random mode
+    random)
+        [ -z "${2:-}" ] && { echo "❌ Usage: ultraspan random DIR [MODE]"; exit 1; }
         stop_random_mode
-        
-        # Get default mode from config
         DEFAULT_MODE=$(get_default_mode)
-        
-        # Start random mode
         start_random_mode "$2" "${3:-$DEFAULT_MODE}"
         ;;
-        
-    "interval")
-        if [ -z "${2:-}" ]; then
-            echo "⏰ Current random interval: ${RANDOM_INTERVAL:-30} minutes"
-            echo "   Usage: ultraspan interval MINUTES"
-            echo "   Example: ultraspan interval 10"
-        else
-            set_interval "$2"
-        fi
+    random-stop) stop_random_mode ;;
+    random-status) show_random_status ;;
+    interval)
+        [ -z "${2:-}" ] && { echo "⏰ Interval: ${RANDOM_INTERVAL} min"; exit 0; }
+        set_interval "$2"
         ;;
-        
-    "refresh-start")
-        # Stop any existing refresh first
+    refresh-start)
         stop_refresh_mode
-        
-        # Start refresh with specified interval (default 180 minutes)
         start_refresh_mode "${2:-180}"
         ;;
-        
-    "refresh-stop")
-        stop_refresh_mode
-        ;;
-        
-    "refresh-status")
-        show_refresh_status
-        ;;
-        
-    "status")
-        show_status
-        ;;
-        
-    "info")
-        if [ -z "${2:-}" ]; then
-            echo "❌ Error: No image specified"
-            echo "   Usage: ultraspan info IMAGE_PATH"
-            exit 1
-        fi
+    refresh-stop) stop_refresh_mode ;;
+    refresh-status) show_refresh_status ;;
+    status) show_status ;;
+    info)
+        [ -z "${2:-}" ] && { echo "❌ Usage: ultraspan info IMAGE"; exit 1; }
         show_image_info "$2"
         ;;
-        
-    "list")
-        list_recent
+    list) list_recent ;;
+    mode)
+        [ -z "${2:-}" ] && { echo "📐 Mode: ${MODE:-zoom}"; exit 0; }
+        set_mode "$2"
         ;;
-        
-    "mode")
-        if [ -z "${2:-}" ]; then
-            # Show current mode
-            load_config
-            echo "📐 Current mode: ${MODE:-zoom}"
-        else
-            set_mode "$2"
-        fi
+    bg-type)
+        [ -z "${2:-}" ] && { echo "🎨 Background: $BG_TYPE"; exit 0; }
+        set_bg_type "$2"
         ;;
-        
-    "bg-type")
-        if [ -z "${2:-}" ]; then
-            echo "🎨 Current background type: $BG_TYPE"
-            echo "   Usage: ultraspan bg-type [blur|solid]"
-        else
-            set_bg_type "$2"
-        fi
+    blur)
+        [ -z "${2:-}" ] && { echo "🎭 Blur: $BLUR_AMOUNT"; exit 0; }
+        set_blur "$2"
         ;;
-        
-    "blur")
-        if [ -z "${2:-}" ]; then
-            echo "🎭 Current blur amount: $BLUR_AMOUNT"
-            echo "   Usage: ultraspan blur [0-100]"
-        else
-            set_blur "$2"
-        fi
+    color)
+        [ -z "${2:-}" ] && { echo "🎨 Color: $BG_COLOR"; exit 0; }
+        set_color "$2"
         ;;
-        
-    "color")
-        if [ -z "${2:-}" ]; then
-            echo "🎨 Current solid color: $BG_COLOR"
-            echo "   Usage: ultraspan color [HEX_COLOR]"
-            echo "   Example: ultraspan color \"#1a1a1a\""
-        else
-            set_color "$2"
-        fi
+    fullscreen)
+        [ -z "${2:-}" ] && { echo "📺 Fullscreen pause: $FULLSCREEN_PAUSE"; exit 0; }
+        set_fullscreen_pause "$2"
         ;;
-        
-    "restore")
-        restore_default
-        ;;
-        
-    "clean")
-        clean_cache
-        ;;
-        
-        "fullscreen")
-        if [ -z "${2:-}" ]; then
-            # Show current setting
-            load_config
-            echo "📺 Full-screen pause is currently: ${FULLSCREEN_PAUSE:-true}"
-            echo "   Usage: ultraspan fullscreen [on|off]"
-        else
-            set_fullscreen_pause "$2"
-            # Restart refresh if running to apply new setting
-            if [ -f "$REFRESH_FILE" ]; then
-                local interval
-                interval=$(head -n1 "$REFRESH_FILE" | cut -d= -f2)
-                echo "🔄 Restarting refresh to apply new fullscreen setting..."
-                stop_refresh_mode
-                start_refresh_mode "$interval"
-            fi
-        fi
-        ;;
-    
-    "help"|"--help"|"-h")
-        show_help
-        ;;
-        
+    restore) restore_default ;;
+    clean) clean_cache ;;
+    help|--help|-h) show_help ;;
+    --version) echo "Ultraspan version $VERSION" ;;
     *)
         echo "❌ Unknown command: $1"
-        echo ""
         show_help
         exit 1
         ;;
