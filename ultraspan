@@ -318,7 +318,7 @@ set_per_monitor_wallpaper() {
     if [ ! -f "$CACHE_FILE" ]; then
         echo "⚙️  Processing images..."
         local bg_canvas
-        bg_canvas=$(mktemp) || { echo "❌ Failed to create temp canvas"; exit 1; }
+        bg_canvas=$(mktemp --suffix=.png) || { echo "❌ Failed to create temp canvas"; exit 1; }
         if [ "$BG_TYPE" = "blur" ]; then
             $IM_CMD "${images[0]}" -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -blur "0x${BLUR_AMOUNT}" "$bg_canvas"
         else
