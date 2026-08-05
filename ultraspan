@@ -1,13 +1,13 @@
 #!/bin/bash
 # ============================================
-# Combined Single-Span Multi-Monitor Wallpaper Utility
+# Combined Single-Span Multi-Monitor Wallpaper Utility System
 # ============================================
-# Version 4.1 - Brought to you by hisovereign
+# Version 4.1.1 - Brought to you by hisovereign
 # ============================================
 
-export MAGICK_THREAD_LIMIT=1   # optional: remove this line if you want full speed
+#export MAGICK_THREAD_LIMIT=1   # optional: remove this line if you want full speed
 
-VERSION="4.1"
+VERSION="4.1.1"
 CONFIG_DIR="$HOME/.config/ultraspan"
 CONFIG_FILE="$CONFIG_DIR/config"
 CACHE_DIR="$HOME/.cache/ultraspan"
@@ -61,6 +61,66 @@ trap cleanup EXIT
 
 debug_log() {
     [ "$DEBUG" = true ] && echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE"
+}
+
+# -----------------------------
+# HELPER FUNCTIONS
+# -----------------------------
+
+show_help() {
+    cat << 'EOF'
+Ultraspan - Combined Single-Span Wallpaper Manager
+================================================
+
+COMMANDS:
+  set IMAGE_PATH [MODE]      Set wallpaper with optional mode
+  mode MODE                  Set default mode: zoom, fit, center
+  bg-type [TYPE]            Set background type: blur, solid
+  blur [0-100]              Set blur amount (default: 15)
+  color [COLOR]             Set solid color (hex: "#RRGGBB" or RRGGBB)
+  random DIR [MODE]          Start random rotation from directory
+  random-multi DIR [MODE]    Start multi-wallpaper random rotaion from directory
+  random-stop                Stop random rotation
+  random-status              Show random rotation status
+  interval MINUTES           Set random rotation interval (default: 30)
+  refresh-start [MINUTES]    Start periodic wallpaper refresh to prevent blur
+  refresh-stop               Stop periodic refresh
+  refresh-status             Show refresh status
+  list                      List recent wallpapers
+  status                    Show current wallpaper and settings
+  info IMAGE_PATH           Show image info and preview size
+  fullscreen [on|off]        Enable/disable auto-pause during fullscreen apps (default: on)
+  restore                    Restore default system wallpaper
+  clean                      Clear wallpaper cache
+  refresh-wallpaper          manually trigger walpaper setting refresh
+  set-config                 use to update config vlaues directly
+  help                       Show this help
+  
+  set-per-monitor ~/path/to/imageA ~path/to/imageB [MODE] Sets different wallpapers per monitor from left to right
+  
+
+MODES:
+  zoom      - Crop and zoom to fill all monitors
+  fit       - Fit image within space (with background)
+  center    - Center image (with background)
+
+BACKGROUND TYPES:
+  blur      - Use blurred version of image as background
+  solid     - Use solid color as background
+
+EXAMPLES:
+  ultraspan set ~/Pictures/wallpaper.jpg
+  ultraspan set ~/Pictures/landscape.jpg fit
+  ultraspan random ~/Pictures/Wallpapers zoom
+  ultraspan color 000000
+  ultraspan interval 10
+  ultraspan refresh-start 5
+  ultraspan refresh-stop
+  ultraspan random-multi ~/Pictures/ultraspan fit
+  ultraspan set-config refresh_interval 120
+  ultraspan set-per-monitor ~/Pictures/ultraspan/img1.jpg ~/Pictures/ultraspan/img2.jpg ~/Pictures/ultraspan/img3.jpg zoom
+  ultraspan status
+EOF
 }
 
 # ---------- Monitor geometry helpers (unchanged) ----------
@@ -619,6 +679,70 @@ show_random_status() {
     fi
 }
 
+start_random_multi_mode() {
+    local directory="$1"
+    local mode="${2:-zoom}"
+    local interval="${RANDOM_INTERVAL:-30}"
+    [ -d "$directory" ] || { echo "❌ Error: Directory not found"; exit 1; }
+
+    local images=()
+    while IFS= read -r -d $'\0' file; do
+        images+=("$file")
+    done < <(find "$directory" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.webp" \) -print0)
+
+    get_monitor_info
+    local N=$MONITOR_COUNT
+    [ ${#images[@]} -lt $N ] && { echo "❌ Not enough images ($N needed)"; exit 1; }
+
+    echo "📁 Found ${#images[@]} images, need $N per rotation"
+    echo "⏰ Interval: $interval minutes"
+    echo "📐 Mode: $mode"
+
+    mkdir -p "$CONFIG_DIR"
+    echo "directory=$directory" > "$RANDOM_FILE"
+    echo "mode=$mode" >> "$RANDOM_FILE"
+    echo "interval=$interval" >> "$RANDOM_FILE"
+    echo "pid=$$" >> "$RANDOM_FILE"
+    echo "multi=true" >> "$RANDOM_FILE"
+
+    pick_random_set() {
+        # Pick N unique random images
+        local selected=()
+        local indices=()
+        local count=${#images[@]}
+        while [ ${#indices[@]} -lt $N ]; do
+            local idx=$((RANDOM % count))
+            if [[ ! " ${indices[@]} " =~ " ${idx} " ]]; then
+                indices+=($idx)
+            fi
+        done
+        for idx in "${indices[@]}"; do
+            selected+=("${images[$idx]}")
+        done
+        echo "${selected[@]}"
+    }
+
+    local first_set
+    first_set=($(pick_random_set))
+    echo "🎲 First random set: ${first_set[@]}"
+    set_per_monitor_wallpaper "${first_set[@]}" "$mode"
+
+    (
+        exec 9>&-
+        while true; do
+            sleep $((interval * 60))
+            [ -f "$RANDOM_FILE" ] || exit 0
+            local new_set
+            new_set=($(pick_random_set))
+            echo "$(date) - 🔄 Rotating to: ${new_set[@]}"
+            set_per_monitor_wallpaper "${new_set[@]}" "$mode"
+            wait
+        done
+    ) &
+    echo $! >> "$RANDOM_FILE"
+    disown
+}
+
 set_interval() {
     local interval="$1"
     [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 1 ] || { echo "❌ Invalid interval"; exit 1; }
@@ -678,7 +802,14 @@ set_mode() {
     MODE="$1"
     update_config "mode" "$MODE"
     echo "✅ Default mode: $MODE"
-    [ -f "$STATE_FILE" ] && refresh_wallpaper
+    if [ -f "$STATE_FILE" ]; then
+        local recent_image
+        recent_image=$(head -n1 "$STATE_FILE")
+        if [ -f "$recent_image" ]; then
+            echo "🔄 Reapplying current wallpaper with new mode..."
+            set_wallpaper "$recent_image" "$MODE"
+        fi
+    fi
 }
 
 set_bg_type() {
@@ -686,7 +817,15 @@ set_bg_type() {
     BG_TYPE="$1"
     update_config "bg_type" "$BG_TYPE"
     echo "✅ Background type: $BG_TYPE"
-    [ -f "$STATE_FILE" ] && refresh_wallpaper
+    if [ -f "$STATE_FILE" ]; then
+        local recent_image recent_mode
+        recent_image=$(head -n1 "$STATE_FILE")
+        recent_mode=$(sed -n '2p' "$STATE_FILE" || echo "zoom")
+        if [ -f "$recent_image" ]; then
+            echo "🔄 Reapplying current wallpaper with new background type..."
+            set_wallpaper "$recent_image" "$recent_mode"
+        fi
+    fi
 }
 
 set_blur() {
@@ -695,7 +834,15 @@ set_blur() {
     BLUR_AMOUNT="$amt"
     update_config "blur" "$BLUR_AMOUNT"
     echo "✅ Blur: $BLUR_AMOUNT"
-    [ -f "$STATE_FILE" ] && [ "$BG_TYPE" = "blur" ] && refresh_wallpaper
+    if [ -f "$STATE_FILE" ] && [ "$BG_TYPE" = "blur" ]; then
+        local recent_image recent_mode
+        recent_image=$(head -n1 "$STATE_FILE")
+        recent_mode=$(sed -n '2p' "$STATE_FILE" || echo "zoom")
+        if [ -f "$recent_image" ]; then
+            echo "🔄 Reapplying current wallpaper with new blur..."
+            set_wallpaper "$recent_image" "$recent_mode"
+        fi
+    fi
 }
 
 set_color() {
@@ -807,6 +954,12 @@ case "$COMMAND" in
         [ -z "${2:-}" ] && { echo "❌ Usage: ultraspan info IMAGE"; exit 1; }
         show_image_info "$2"
         ;;
+    "random-multi")
+        [ -z "${2:-}" ] && { echo "❌ Usage: ultraspan random-multi DIR [MODE]"; exit 1; }
+        stop_random_mode
+        DEFAULT_MODE=$(get_default_mode)
+        start_random_multi_mode "$2" "${3:-$DEFAULT_MODE}"
+        ;;
     list) list_recent ;;
     mode)
         [ -z "${2:-}" ] && { echo "📐 Mode: ${MODE:-zoom}"; exit 0; }
@@ -827,6 +980,15 @@ case "$COMMAND" in
     fullscreen)
         [ -z "${2:-}" ] && { echo "📺 Fullscreen pause: $FULLSCREEN_PAUSE"; exit 0; }
         set_fullscreen_pause "$2"
+        ;;
+    "set-config")
+        [ -z "${2:-}" ] || [ -z "${3:-}" ] && { echo "❌ Usage: ultraspan set-config KEY VALUE"; exit 1; }
+        update_config "$2" "$3"
+        echo "✅ Config $2 = $3"
+        ;;
+
+    "refresh-wallpaper")
+        refresh_wallpaper
         ;;
     restore) restore_default ;;
     clean) clean_cache ;;
