@@ -382,19 +382,29 @@ set_per_monitor_wallpaper() {
         local temp_files=()
         local pids=()
         for i in $(seq 0 $((MONITOR_COUNT-1))); do
-            local img="${images[i]}"
-            local mon_w="${MONITOR_W[i]}" mon_h="${MONITOR_H[i]}"
-            ( process_image_for_area "$img" "$mon_w" "$mon_h" "$mode" ) &
+            local outfile
+            outfile="$(mktemp)" || { log "ERROR" "mktemp failed"; return 1; }
+            temp_files+=("$outfile")
+            process_image_for_area "${images[i]}" "${MONITOR_W[i]}" "${MONITOR_H[i]}" "$mode" > "$outfile" &
             pids+=($!)
         done
         wait "${pids[@]}"
+        # Now temp_files contain the actual output file paths (the function prints the temp path)
+        # We must read the actual path from each file because the function already outputs the temp filename to stdout
         for i in $(seq 0 $((MONITOR_COUNT-1))); do
-            temp_files+=("$(process_image_for_area "${images[i]}" "${MONITOR_W[i]}" "${MONITOR_H[i]}" "$mode")")
+            local path_from_file
+            path_from_file="$(cat "${temp_files[i]}")"
+            if [[ -z "$path_from_file" ]] || [[ ! -f "$path_from_file" ]]; then
+                log "ERROR" "Failed to process image for monitor $i"
+                return 1
+            fi
+            temp_files[i]="$path_from_file"
         done
 
         for i in $(seq 0 $((MONITOR_COUNT-1))); do
             local proc="${temp_files[i]}"
             local mon_x="${MONITOR_X[i]}" mon_y="${MONITOR_Y[i]}"
+            local mon_w="${MONITOR_W[i]}" mon_h="${MONITOR_H[i]}"
             local img_w img_h
             img_w="$($IM_IDENTIFY -format "%w" "$proc")"
             img_h="$($IM_IDENTIFY -format "%h" "$proc")"
