@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan - Ultimate Multi‑Monitor Wallpaper Utility
 # ============================================
-# Version 5.1.1 - Brought to you by hisovereign
+# Version 5.2.0 - Brought to you by hisovereign
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -17,9 +17,12 @@ CONFIG[fullscreen_pause]="true"
 CONFIG[random_interval]=30
 CONFIG[refresh_interval]=480
 CONFIG[multi_random]="false"
-CONFIG[backend]="gsettings"   # gsettings, feh, nitrogen
+CONFIG[backend]="gsettings"
+CONFIG[max_cache_mb]=2000          # max cache size in MB, 0 = no limit
+CONFIG[magick_memory]="2GiB"       # ImageMagick memory limit
+CONFIG[config_version]=1           # config version for migration
 
-VERSION="5.1.1"
+VERSION="5.2.0"
 CONFIG_DIR="${HOME}/.config/ultraspan"
 CONFIG_FILE="${CONFIG_DIR}/config"
 CACHE_DIR="${HOME}/.cache/ultraspan"
@@ -37,7 +40,7 @@ DEBUG=false
 VERBOSE=false
 
 # ----------------------------------------------------------------------
-# ImageMagick detection
+# ImageMagick detection & memory limit
 # ----------------------------------------------------------------------
 if command -v magick &>/dev/null; then
     IM_CMD="magick"
@@ -73,7 +76,6 @@ debug_log() {
 # Locking - blocking wait, stale detection
 # ----------------------------------------------------------------------
 acquire_lock() {
-    # Check for stale lock file (PID not alive)
     if [[ -f "$LOCK_FILE" ]]; then
         local lock_pid
         lock_pid="$(cat "$LOCK_FILE" 2>/dev/null)"
@@ -82,24 +84,20 @@ acquire_lock() {
             rm -f "$LOCK_FILE"
         fi
     fi
-    # Open file descriptor 9 for locking
     exec 9>"$LOCK_FILE" || { log "ERROR" "Cannot open lock file"; exit 1; }
-    # Block until lock is acquired
     flock 9 || { log "ERROR" "Failed to acquire lock"; exit 1; }
-    # Write our PID into the file after locking
     echo "$$" > "$LOCK_FILE"
-    log "DEBUG" "Lock acquired (PID $$)."
+    debug_log "Lock acquired (PID $$)."
 }
 
 release_lock() {
     flock -u 9 2>/dev/null
     exec 9>&-
-    log "DEBUG" "Lock released."
+    debug_log "Lock released."
 }
 
 cleanup() {
     release_lock
-    # If we are the daemon, kill children and remove PID file
     if [[ -f "$DAEMON_PIDFILE" ]] && [[ "$(cat "$DAEMON_PIDFILE")" == "$$" ]]; then
         log "INFO" "Daemon cleaning up: killing children."
         pkill -P $$ 2>/dev/null
@@ -110,8 +108,20 @@ cleanup() {
 trap cleanup EXIT
 
 # ----------------------------------------------------------------------
-# Config helpers (using associative array)
+# Config helpers (with migration)
 # ----------------------------------------------------------------------
+migrate_config() {
+    local current_version="${CONFIG[config_version]:-0}"
+    if (( current_version < 1 )); then
+        log "INFO" "Migrating config to version 1"
+        # Ensure new keys exist
+        CONFIG[max_cache_mb]=2000
+        CONFIG[magick_memory]="2GiB"
+        CONFIG[config_version]=1
+        update_config config_version 1   # rewrite config file
+    fi
+}
+
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         local key value
@@ -123,7 +133,7 @@ load_config() {
             fi
         done < "$CONFIG_FILE"
     fi
-    # Set defaults if missing
+    # Set defaults for missing keys
     : "${CONFIG[mode]:=zoom}"
     : "${CONFIG[bg_type]:=blur}"
     : "${CONFIG[blur]:=15}"
@@ -133,6 +143,11 @@ load_config() {
     : "${CONFIG[refresh_interval]:=480}"
     : "${CONFIG[multi_random]:=false}"
     : "${CONFIG[backend]:=gsettings}"
+    : "${CONFIG[max_cache_mb]:=2000}"
+    : "${CONFIG[magick_memory]:=2GiB}"
+    : "${CONFIG[config_version]:=1}"
+    # Run migration if needed
+    migrate_config
 }
 
 update_config() {
@@ -148,7 +163,24 @@ update_config() {
 }
 
 # ----------------------------------------------------------------------
-# Monitor geometry (robust)
+# Cache size management
+# ----------------------------------------------------------------------
+trim_cache() {
+    local max_mb="${CONFIG[max_cache_mb]}"
+    [[ "$max_mb" -eq 0 ]] && return   # no limit
+    local current_size
+    current_size="$(du -sm "$CACHE_DIR" 2>/dev/null | cut -f1)"
+    while [[ "$current_size" -gt "$max_mb" ]]; do
+        local oldest
+        oldest="$(find "$CACHE_DIR" -type f -printf '%T@ %p\n' | sort -n | head -1 | cut -d' ' -f2)"
+        [[ -z "$oldest" ]] && break
+        rm -f "$oldest"
+        current_size="$(du -sm "$CACHE_DIR" 2>/dev/null | cut -f1)"
+    done
+}
+
+# ----------------------------------------------------------------------
+# Monitor geometry (with sanity check)
 # ----------------------------------------------------------------------
 get_monitor_info() {
     unset MONITOR_NAMES MONITOR_X MONITOR_Y MONITOR_W MONITOR_H
@@ -171,17 +203,28 @@ get_monitor_info() {
         fi
     done < <(xrandr --current --listmonitors 2>/dev/null)
     MONITOR_COUNT=$index
+    if [[ $MONITOR_COUNT -eq 0 ]]; then
+        log "ERROR" "No monitors detected. Cannot continue."
+        return 1
+    fi
 }
 
 get_total_span() {
-    get_monitor_info
+    get_monitor_info || exit 1
     TOTAL_WIDTH=$((MAX_X - MIN_X))
     TOTAL_HEIGHT=$((MAX_Y - MIN_Y))
     debug_log "Span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
 }
 
 # ----------------------------------------------------------------------
-# Image processing: parallel per‑monitor, with mtime in cache key
+# Filename safety: replace pipe character
+# ----------------------------------------------------------------------
+safe_filename() {
+    echo "$1" | sed 's/|/%PIPE%/g'
+}
+
+# ----------------------------------------------------------------------
+# Image processing helpers
 # ----------------------------------------------------------------------
 get_file_mtime() {
     stat -c %Y "$1" 2>/dev/null || echo "0"
@@ -227,7 +270,7 @@ process_image_for_area() {
 }
 
 # ----------------------------------------------------------------------
-# Set wallpaper (main)
+# Set wallpaper
 # ----------------------------------------------------------------------
 set_wallpaper() {
     local image="$1" mode="${2:-${CONFIG[mode]}}" force="${3:-false}"
@@ -235,7 +278,6 @@ set_wallpaper() {
 
     log "INFO" "Setting wallpaper: $(basename "$image") (mode $mode)"
     get_total_span
-    [[ $TOTAL_WIDTH -eq 0 ]] || [[ $TOTAL_HEIGHT -eq 0 ]] && { log "ERROR" "Cannot determine monitor layout"; return 1; }
 
     mkdir -p "$CACHE_DIR" "$CONFIG_DIR"
 
@@ -243,10 +285,14 @@ set_wallpaper() {
     abs_image="$(readlink -f "$image")"
     local mtime
     mtime="$(get_file_mtime "$abs_image")"
-    local key_string="${abs_image}|${mtime}|${mode}|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
+    local safe_abs="$(safe_filename "$abs_image")"
+    local key_string="${safe_abs}|${mtime}|${mode}|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
     local cache_key
     cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
     local CACHE_FILE="${CACHE_DIR}/${cache_key}.jpg"
+
+    # Trim cache before writing new file
+    trim_cache
 
     if [[ "$force" == "true" ]] || [[ ! -f "$CACHE_FILE" ]]; then
         log "INFO" "Processing image (cache miss or forced)..."
@@ -342,7 +388,7 @@ set_wallpaper() {
 }
 
 # ----------------------------------------------------------------------
-# Per‑monitor (parallel processing)
+# Per‑monitor wallpaper (parallel)
 # ----------------------------------------------------------------------
 set_per_monitor_wallpaper() {
     local images=("$@")
@@ -363,11 +409,14 @@ set_per_monitor_wallpaper() {
     local key_string="${mode}|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
     for img in "${images[@]}"; do
         abs_img="$(readlink -f "$img")"
-        key_string="${key_string}|${abs_img}|$(get_file_mtime "$abs_img")"
+        safe_abs="$(safe_filename "$abs_img")"
+        key_string="${key_string}|${safe_abs}|$(get_file_mtime "$abs_img")"
     done
     local cache_key
     cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
     local CACHE_FILE="${CACHE_DIR}/${cache_key}.jpg"
+
+    trim_cache
 
     if [[ ! -f "$CACHE_FILE" ]]; then
         log "INFO" "Processing per‑monitor images in parallel..."
@@ -389,8 +438,8 @@ set_per_monitor_wallpaper() {
             pids+=($!)
         done
         wait "${pids[@]}"
-        # Now temp_files contain the actual output file paths (the function prints the temp path)
-        # We must read the actual path from each file because the function already outputs the temp filename to stdout
+
+        # Read the true processed image paths
         for i in $(seq 0 $((MONITOR_COUNT-1))); do
             local path_from_file
             path_from_file="$(cat "${temp_files[i]}")"
@@ -585,13 +634,13 @@ stop_random_mode() {
 }
 
 # ----------------------------------------------------------------------
-# Refresh daemon (standalone)
+# Refresh daemon (with orphan cleanup)
 # ----------------------------------------------------------------------
 start_refresh_mode() {
     local interval="${1:-${CONFIG[refresh_interval]}}"
     [[ "$interval" =~ ^[0-9]+$ ]] || { log "ERROR" "Interval must be a number (minutes)"; return 1; }
 
-    stop_refresh_mode
+    stop_refresh_mode   # ensure no stale processes
     sleep 0.5
 
     mkdir -p "$CONFIG_DIR"
@@ -626,16 +675,12 @@ start_refresh_mode() {
 }
 
 stop_refresh_mode() {
-    if [[ -f "$REFRESH_FILE" ]]; then
-        local pids
-        pids="$(tail -n +2 "$REFRESH_FILE")"
-        for pid in $pids; do
-            kill "$pid" 2>/dev/null
-        done
-        rm -f "$REFRESH_FILE"
-        rm -f "$FULLSCREEN_FILE"
-        log "INFO" "Periodic refresh stopped."
-    fi
+    # Kill all refresh-related processes aggressively
+    pkill -f "ultraspan.*refresh" 2>/dev/null || true
+    pkill -f "ultraspan.*monitor_fullscreen" 2>/dev/null || true
+    pkill -f "ultraspan.*monitor_layout" 2>/dev/null || true
+    rm -f "$REFRESH_FILE" "$FULLSCREEN_FILE"
+    log "INFO" "Periodic refresh stopped."
 }
 
 # ----------------------------------------------------------------------
@@ -684,7 +729,132 @@ monitor_layout() {
 }
 
 # ----------------------------------------------------------------------
-# Preview command
+# Daemon with flags
+# ----------------------------------------------------------------------
+start_daemon() {
+    local mode="${1:-background}"
+    mkdir -p "$PID_DIR"
+
+    # Ensure no other daemon is running
+    if [[ -f "$DAEMON_PIDFILE" ]] && kill -0 "$(cat "$DAEMON_PIDFILE")" 2>/dev/null; then
+        log "ERROR" "Daemon already running (PID $(cat "$DAEMON_PIDFILE"))."
+        return 1
+    fi
+
+    acquire_lock
+    # Stop any existing refresh/random to avoid duplicates
+    stop_refresh_mode
+    stop_random_mode
+    release_lock
+
+    log "INFO" "Starting ultraspan daemon (mode: $mode)..."
+
+    # Start services inside a subshell for background mode,
+    # or directly for foreground/oneshot.
+    case "$mode" in
+        foreground)
+            echo "$$" > "$DAEMON_PIDFILE"
+            start_refresh_mode "${CONFIG[refresh_interval]}"
+            start_saved_random
+            while true; do sleep 3600; done
+            ;;
+        oneshot)
+            echo "$$" > "$DAEMON_PIDFILE"
+            start_refresh_mode "${CONFIG[refresh_interval]}"
+            start_saved_random
+            exit 0
+            ;;
+        *)
+            # Background: fork a child that does all the work,
+            # and the parent exits immediately.
+            (
+                echo "$$" > "$DAEMON_PIDFILE"
+                start_refresh_mode "${CONFIG[refresh_interval]}"
+                start_saved_random
+                while true; do sleep 3600; done
+            ) &
+            disown
+            log "INFO" "Daemon sent to background."
+            exit 0
+            ;;
+    esac
+}
+
+# Helper to start random if its state file exists
+start_saved_random() {
+    if [[ -f "$RANDOM_FILE" ]]; then
+        local dir mode multi
+        while IFS='=' read -r key value; do
+            case "$key" in
+                directory) dir="$value" ;;
+                mode) mode="$value" ;;
+                multi) multi="$value" ;;
+            esac
+        done < "$RANDOM_FILE"
+        if [[ -n "$dir" ]]; then
+            if [[ "$multi" == "true" ]]; then
+                start_random_multi_mode "$dir" "$mode"
+            else
+                start_random_mode "$dir" "$mode"
+            fi
+        fi
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Data Wipe
+# ----------------------------------------------------------------------
+data_wipe_ultraspan() {
+    echo "This will remove ALL ultraspan configuration, cache, and state files."
+    echo "Your wallpapers will be reset to the system default."
+    read -p "Are you sure? (y/N) " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        return 0
+    fi
+    
+    # Release lock before stopping daemon (we will remove the lock file later)
+    release_lock 
+
+    # Stop daemon and services first
+    stop_daemon
+    stop_refresh_mode
+    stop_random_mode
+
+    # Remove config, cache, PID dir, lock file
+    rm -rf "$CONFIG_DIR" "$CACHE_DIR" "$PID_DIR" "$LOCK_FILE"
+
+    # Reset wallpaper to default
+    local default_wp="/usr/share/backgrounds/linuxmint/default_background.jpg"
+    if [[ -f "$default_wp" ]]; then
+        gsettings set org.cinnamon.desktop.background picture-uri "file://$default_wp"
+    else
+        gsettings reset org.cinnamon.desktop.background picture-uri
+    fi
+    gsettings set org.cinnamon.desktop.background picture-options "zoom"
+
+    echo "All ultraspan data removed. You may now delete the script itself."
+}
+
+# ----------------------------------------------------------------------
+# Stop daemon
+# ----------------------------------------------------------------------
+stop_daemon() {
+    if [[ -f "$DAEMON_PIDFILE" ]]; then
+        local pid
+        pid="$(cat "$DAEMON_PIDFILE")"
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null
+            log "INFO" "Daemon stopped."
+        fi
+        rm -f "$DAEMON_PIDFILE"
+    fi
+    stop_refresh_mode
+    stop_random_mode
+}
+
+# ----------------------------------------------------------------------
+# Preview, list, diagnose, systemd, completions (unchanged)
 # ----------------------------------------------------------------------
 preview_wallpaper() {
     local image="$1" mode="${2:-${CONFIG[mode]}}"
@@ -710,9 +880,6 @@ preview_wallpaper() {
     fi
 }
 
-# ----------------------------------------------------------------------
-# list-images command
-# ----------------------------------------------------------------------
 list_images() {
     local dir="$1"
     [[ -d "$dir" ]] || { log "ERROR" "Directory not found: $dir"; return 1; }
@@ -725,9 +892,6 @@ list_images() {
     done
 }
 
-# ----------------------------------------------------------------------
-# Diagnose command
-# ----------------------------------------------------------------------
 diagnose() {
     echo "=== Ultraspan Diagnose ==="
     echo "Version: $VERSION"
@@ -770,9 +934,6 @@ diagnose() {
     fi
 }
 
-# ----------------------------------------------------------------------
-# Systemd service generator
-# ----------------------------------------------------------------------
 generate_systemd() {
     cat <<EOF
 [Unit]
@@ -791,9 +952,6 @@ WantedBy=default.target
 EOF
 }
 
-# ----------------------------------------------------------------------
-# Bash completion generator
-# ----------------------------------------------------------------------
 generate_completion() {
     cat <<'EOF'
 _ultraspan() {
@@ -809,81 +967,11 @@ _ultraspan() {
             ;;
     esac
     if [[ $cword -eq 1 ]]; then
-        COMPREPLY=($(compgen -W "set set-per-monitor random random-multi random-stop random-status interval refresh-start refresh-stop refresh-status status info list-images preview diagnose daemon daemon-stop set-config clean restore help --version" -- "$cur"))
+        COMPREPLY=($(compgen -W "set set-per-monitor random random-multi random-stop random-status interval refresh-start refresh-stop refresh-status status info list-images preview diagnose daemon daemon-stop data-wipe set-config clean restore help --version" -- "$cur"))
     fi
 }
 complete -F _ultraspan ultraspan
 EOF
-}
-
-# ----------------------------------------------------------------------
-# Daemon functions (now releases lock after startup)
-# ----------------------------------------------------------------------
-start_daemon() {
-    mkdir -p "$PID_DIR"
-    # Check for existing daemon using PID file (no lock needed)
-    if [[ -f "$DAEMON_PIDFILE" ]] && kill -0 "$(cat "$DAEMON_PIDFILE")" 2>/dev/null; then
-        log "ERROR" "Daemon already running (PID $(cat "$DAEMON_PIDFILE"))."
-        return 1
-    fi
-
-    # Acquire lock to safely stop any existing refresh/random and start new ones
-    acquire_lock
-    # Stop any existing refresh/random to avoid duplicates
-    stop_refresh_mode
-    stop_random_mode
-    # Write daemon PID
-    echo "$$" > "$DAEMON_PIDFILE"
-    # Release lock immediately so other commands can run
-    release_lock
-
-    log "INFO" "Starting ultraspan daemon..."
-
-    # Start periodic refresh with configured interval
-    start_refresh_mode "${CONFIG[refresh_interval]}"
-
-    # Start random if its state file exists
-    if [[ -f "$RANDOM_FILE" ]]; then
-        local dir mode multi
-        while IFS='=' read -r key value; do
-            case "$key" in
-                directory) dir="$value" ;;
-                mode) mode="$value" ;;
-                multi) multi="$value" ;;
-            esac
-        done < "$RANDOM_FILE"
-        if [[ -n "$dir" ]]; then
-            if [[ "$multi" == "true" ]]; then
-                start_random_multi_mode "$dir" "$mode"
-            else
-                start_random_mode "$dir" "$mode"
-            fi
-        fi
-    fi
-
-    log "INFO" "Daemon started with PID $$"
-
-    # Keep daemon alive without holding any lock
-    while true; do
-        sleep 3600
-    done
-}
-
-stop_daemon() {
-    acquire_lock  # Wait for other commands to finish
-    if [[ -f "$DAEMON_PIDFILE" ]]; then
-        local pid
-        pid="$(cat "$DAEMON_PIDFILE")"
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -TERM "$pid" 2>/dev/null
-            log "INFO" "Daemon stopped."
-        fi
-        rm -f "$DAEMON_PIDFILE"
-    fi
-    # Also stop refresh and random individually (just in case)
-    stop_refresh_mode
-    stop_random_mode
-    release_lock
 }
 
 # ----------------------------------------------------------------------
@@ -894,37 +982,38 @@ show_help() {
 Ultraspan v$VERSION - Advanced Multi‑Monitor Wallpaper Manager
 
 COMMANDS:
-  set IMAGE [MODE] [force]     Set wallpaper (force to ignore cache)
-  set-per-monitor IMG1 IMG2 ... [MODE]   Set per‑monitor wallpapers
-  random DIR [MODE]            Start random rotation (single image)
-  random-multi DIR [MODE]      Start random per‑monitor rotation
-  random-stop                  Stop random rotation
-  random-status                Show random status
-  interval MINUTES             Set random rotation interval
-  refresh-start [MINUTES]      Start periodic refresh (auto‑reapply)
-  refresh-stop                 Stop periodic refresh
-  refresh-status               Show refresh status
-  refresh-wallpaper            Manually reapply current wallpaper
-  status                       Show current settings and wallpaper
-  info IMAGE                   Show image info
-  preview IMAGE [MODE]         Generate a preview and open it
-  list-images DIR              List all images with dimensions
-  diagnose                     Run system diagnostics
-  daemon                       Start all background services (refresh + random if active)
-  daemon-stop                  Stop daemon
-  set-config KEY VALUE         Update config directly
-  mode MODE                    Set default mode (zoom/fit/center)
-  bg-type TYPE                 Set bg type (blur/solid)
-  blur VALUE                   Set blur amount (0‑100)
-  color HEX                    Set solid color (e.g., #RRGGBB)
-  fullscreen [on/off]          Enable/disable auto‑pause on fullscreen
-  backend [gsettings|feh|nitrogen]  Choose wallpaper setter
-  clean                        Clear cache
-  restore                      Restore default system wallpaper
-  generate-systemd             Print systemd service file
-  generate-completion          Print bash completion script
-  help                         Show this help
-  --version                    Show version
+  set IMAGE [MODE] [force]           Set wallpaper (force to ignore cache)
+  set-per-monitor IMG1 IMG2 ... [MODE]  Set per‑monitor wallpapers
+  random DIR [MODE]                  Start random rotation (single image)
+  random-multi DIR [MODE]            Start random per‑monitor rotation
+  random-stop                        Stop random rotation
+  random-status                      Show random status
+  interval MINUTES                   Set random rotation interval
+  refresh-start [MINUTES]            Start periodic refresh
+  refresh-stop                       Stop periodic refresh
+  refresh-status                     Show refresh status
+  refresh-wallpaper                  Manually reapply current wallpaper
+  status                             Show current settings and wallpaper
+  info IMAGE                         Show image info
+  preview IMAGE [MODE]               Generate a preview and open it
+  list-images DIR                    List all images with dimensions
+  diagnose                           Run system diagnostics
+  daemon [--foreground|--oneshot]    Start all background services
+  daemon-stop                        Stop daemon
+  data-wipe                          Remove all ultraspan data (interactive)
+  set-config KEY VALUE               Update config directly
+  mode MODE                          Set default mode (zoom/fit/center)
+  bg-type TYPE                       Set bg type (blur/solid)
+  blur VALUE                         Set blur amount (0‑100)
+  color HEX                          Set solid color (e.g., #RRGGBB)
+  fullscreen [on/off]                Enable/disable auto‑pause on fullscreen
+  backend [gsettings|feh|nitrogen]   Choose wallpaper setter
+  clean                              Clear cache
+  restore                            Restore default system wallpaper
+  generate-systemd                   Print systemd service file
+  generate-completion                Print bash completion script
+  help                               Show this help
+  --version                          Show version
 
 EXAMPLES:
   ultraspan set ~/Pics/wall.jpg zoom
@@ -941,7 +1030,9 @@ EOF
 # ----------------------------------------------------------------------
 main() {
     load_config
-    # Acquire lock for all commands (blocking wait)
+    # Apply ImageMagick memory limit from config
+    export MAGICK_MEMORY_LIMIT="${CONFIG[magick_memory]}"
+
     acquire_lock
 
     local cmd="${1:-help}"
@@ -1017,6 +1108,7 @@ main() {
             echo "Mode: ${CONFIG[mode]}, Background: ${CONFIG[bg_type]}"
             [[ "${CONFIG[bg_type]}" == "blur" ]] && echo "Blur: ${CONFIG[blur]}" || echo "Color: ${CONFIG[color]}"
             echo "Backend: ${CONFIG[backend]}"
+            echo "Cache limit: ${CONFIG[max_cache_mb]} MB"
             [[ -f "$RANDOM_FILE" ]] && echo "Random: active" || echo "Random: inactive"
             [[ -f "$REFRESH_FILE" ]] && echo "Refresh: active" || echo "Refresh: inactive"
             ;;
@@ -1039,12 +1131,21 @@ main() {
             ;;
         diagnose) diagnose ;;
         daemon)
-            # We already hold the lock; but start_daemon will release it after setup
-            start_daemon
-            # Note: start_daemon never returns (infinite loop), but we release lock inside it
+            # Accept optional mode flag
+            local daemon_mode="background"
+            if [[ "$1" == "--foreground" ]]; then
+                daemon_mode="foreground"
+            elif [[ "$1" == "--oneshot" ]]; then
+                daemon_mode="oneshot"
+            fi
+            start_daemon "$daemon_mode"
+            # start_daemon exits for background/oneshot, but foreground loops forever
             ;;
         daemon-stop)
             stop_daemon
+            ;;
+        data-wipe)
+            data_wipe_ultraspan
             ;;
         set-config)
             [[ -z "$1" ]] || [[ -z "$2" ]] && { log "ERROR" "Usage: set-config KEY VALUE"; exit 1; }
@@ -1159,7 +1260,6 @@ main() {
             ;;
     esac
 
-    # Release lock when command finishes (except for daemon which never returns)
     release_lock
 }
 
