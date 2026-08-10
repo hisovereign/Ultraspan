@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan - Ultimate Multi‑Monitor Wallpaper Utility
 # ============================================
-# Version 5.3.0 - Brought to you by hisovereign
+# Version 5.3.1 - Brought to you by hisovereign
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -24,7 +24,7 @@ CONFIG[config_version]=1           # config version for migration
 CONFIG[per_workspace]="false"      # enable per‑workspace wallpapers
 
 
-VERSION="5.2.0"
+VERSION="5.3.1"
 CONFIG_DIR="${HOME}/.config/ultraspan"
 CONFIG_FILE="${CONFIG_DIR}/config"
 CACHE_DIR="${HOME}/.cache/ultraspan"
@@ -524,10 +524,29 @@ refresh_wallpaper() {
         log "WARN" "No wallpaper state found; doing nothing."
         return 1
     fi
-    local recent_line mode
+
+    local recent_line mode saved_bg_type saved_blur_or_color
     recent_line="$(head -n1 "$STATE_FILE")"
     mode="$(sed -n '2p' "$STATE_FILE" | head -n1)"
+    saved_bg_type="$(sed -n '3p' "$STATE_FILE")"
+    saved_blur_or_color="$(sed -n '4p' "$STATE_FILE")"
+
     [[ -z "$mode" ]] && mode="${CONFIG[mode]}"
+    [[ -z "$saved_bg_type" ]] && saved_bg_type="${CONFIG[bg_type]}"
+
+    # Save current global settings (we'll restore them later)
+    local old_bg_type="${CONFIG[bg_type]}"
+    local old_blur="${CONFIG[blur]}"
+    local old_color="${CONFIG[color]}"
+
+    # Temporarily apply the workspace’s saved settings
+    CONFIG[bg_type]="$saved_bg_type"
+    if [[ "$saved_bg_type" == "blur" ]]; then
+        CONFIG[blur]="${saved_blur_or_color:-${CONFIG[blur]}}"
+    else
+        CONFIG[color]="${saved_blur_or_color:-${CONFIG[color]}}"
+    fi
+
     if [[ "$recent_line" =~ ^per-monitor:(.*) ]]; then
         local imgs="${BASH_REMATCH[1]}"
         IFS='|' read -ra img_array <<< "$imgs"
@@ -538,9 +557,17 @@ refresh_wallpaper() {
             set_wallpaper "$recent_image" "$mode" "true"
         else
             log "WARN" "Stored image not found; cannot refresh."
+            CONFIG[bg_type]="$old_bg_type"
+            CONFIG[blur]="$old_blur"
+            CONFIG[color]="$old_color"
             return 1
         fi
     fi
+
+    # Restore the original global settings
+    CONFIG[bg_type]="$old_bg_type"
+    CONFIG[blur]="$old_blur"
+    CONFIG[color]="$old_color"
 }
 
 is_fullscreen_active() {
@@ -762,6 +789,7 @@ monitor_workspace() {
     sleep 2
     local last_ws=""
     while true; do
+        load_config
         local new_ws
         new_ws="$(xdotool get_desktop 2>/dev/null || echo 0)"
         if [[ "$new_ws" != "$last_ws" ]]; then
