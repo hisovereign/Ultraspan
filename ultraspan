@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan - Ultimate Multi‑Monitor Wallpaper Utility
 # ============================================
-# Version 5.2.0 - Brought to you by hisovereign
+# Version 5.3.0 - Brought to you by hisovereign
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -21,6 +21,8 @@ CONFIG[backend]="gsettings"
 CONFIG[max_cache_mb]=2000          # max cache size in MB, 0 = no limit
 CONFIG[magick_memory]="2GiB"       # ImageMagick memory limit
 CONFIG[config_version]=1           # config version for migration
+CONFIG[per_workspace]="false"      # enable per‑workspace wallpapers
+
 
 VERSION="5.2.0"
 CONFIG_DIR="${HOME}/.config/ultraspan"
@@ -117,6 +119,7 @@ migrate_config() {
         # Ensure new keys exist
         CONFIG[max_cache_mb]=2000
         CONFIG[magick_memory]="2GiB"
+        CONFIG[per_workspace]="false"
         CONFIG[config_version]=1
         update_config config_version 1   # rewrite config file
     fi
@@ -145,6 +148,7 @@ load_config() {
     : "${CONFIG[backend]:=gsettings}"
     : "${CONFIG[max_cache_mb]:=2000}"
     : "${CONFIG[magick_memory]:=2GiB}"
+    : "${CONFIG[per_workspace]:=false}"
     : "${CONFIG[config_version]:=1}"
     # Run migration if needed
     migrate_config
@@ -207,6 +211,23 @@ get_monitor_info() {
         log "ERROR" "No monitors detected. Cannot continue."
         return 1
     fi
+}
+
+# ----------------------------------------------------------------------
+# Workspace helpers
+# ----------------------------------------------------------------------
+get_current_workspace() {
+    if ! command -v xdotool &>/dev/null; then
+        log "WARN" "xdotool not found; per‑workspace features may not work correctly."
+        echo 0
+        return
+    fi
+    xdotool get_desktop 2>/dev/null || echo 0
+}
+
+get_state_file() {
+    local ws="${1:-$(get_current_workspace)}"
+    echo "${CONFIG_DIR}/state_workspace_${ws}"
 }
 
 get_total_span() {
@@ -672,6 +693,11 @@ start_refresh_mode() {
         monitor_layout &
         echo $! > "$LAYOUT_MONITOR_PIDFILE"
     fi
+
+    if [[ "${CONFIG[per_workspace]}" == "true" ]]; then
+        monitor_workspace &
+        echo $! >> "$LAYOUT_MONITOR_PIDFILE"   # reuse the same file or create a new one
+    fi
 }
 
 stop_refresh_mode() {
@@ -679,6 +705,7 @@ stop_refresh_mode() {
     pkill -f "ultraspan.*refresh" 2>/dev/null || true
     pkill -f "ultraspan.*monitor_fullscreen" 2>/dev/null || true
     pkill -f "ultraspan.*monitor_layout" 2>/dev/null || true
+    pkill -f "ultraspan.*monitor_workspace" 2>/dev/null || true
     rm -f "$REFRESH_FILE" "$FULLSCREEN_FILE"
     log "INFO" "Periodic refresh stopped."
 }
@@ -729,6 +756,25 @@ monitor_layout() {
 }
 
 # ----------------------------------------------------------------------
+# Workspace change monitor (polling, reliable across Cinnamon versions)
+# ----------------------------------------------------------------------
+monitor_workspace() {
+    sleep 2
+    local last_ws=""
+    while true; do
+        local new_ws
+        new_ws="$(xdotool get_desktop 2>/dev/null || echo 0)"
+        if [[ "$new_ws" != "$last_ws" ]]; then
+            log "INFO" "Workspace changed to $new_ws"
+            STATE_FILE="$(get_state_file "$new_ws")"
+            refresh_wallpaper
+            last_ws="$new_ws"
+        fi
+        sleep 1
+    done
+}
+
+# ----------------------------------------------------------------------
 # Daemon with flags
 # ----------------------------------------------------------------------
 start_daemon() {
@@ -768,7 +814,7 @@ start_daemon() {
             # Background: fork a child that does all the work,
             # and the parent exits immediately.
             (
-                echo "$$" > "$DAEMON_PIDFILE"
+                echo "$BASHPID" > "$DAEMON_PIDFILE"
                 start_refresh_mode "${CONFIG[refresh_interval]}"
                 start_saved_random
                 while true; do sleep 3600; done
@@ -982,38 +1028,49 @@ show_help() {
 Ultraspan v$VERSION - Advanced Multi‑Monitor Wallpaper Manager
 
 COMMANDS:
-  set IMAGE [MODE] [force]           Set wallpaper (force to ignore cache)
-  set-per-monitor IMG1 IMG2 ... [MODE]  Set per‑monitor wallpapers
-  random DIR [MODE]                  Start random rotation (single image)
-  random-multi DIR [MODE]            Start random per‑monitor rotation
-  random-stop                        Stop random rotation
-  random-status                      Show random status
-  interval MINUTES                   Set random rotation interval
-  refresh-start [MINUTES]            Start periodic refresh
-  refresh-stop                       Stop periodic refresh
-  refresh-status                     Show refresh status
-  refresh-wallpaper                  Manually reapply current wallpaper
-  status                             Show current settings and wallpaper
-  info IMAGE                         Show image info
-  preview IMAGE [MODE]               Generate a preview and open it
-  list-images DIR                    List all images with dimensions
-  diagnose                           Run system diagnostics
-  daemon [--foreground|--oneshot]    Start all background services
-  daemon-stop                        Stop daemon
-  data-wipe                          Remove all ultraspan data (interactive)
-  set-config KEY VALUE               Update config directly
-  mode MODE                          Set default mode (zoom/fit/center)
-  bg-type TYPE                       Set bg type (blur/solid)
-  blur VALUE                         Set blur amount (0‑100)
-  color HEX                          Set solid color (e.g., #RRGGBB)
-  fullscreen [on/off]                Enable/disable auto‑pause on fullscreen
-  backend [gsettings|feh|nitrogen]   Choose wallpaper setter
-  clean                              Clear cache
-  restore                            Restore default system wallpaper
-  generate-systemd                   Print systemd service file
-  generate-completion                Print bash completion script
-  help                               Show this help
-  --version                          Show version
+  set [--workspace N] IMAGE [MODE] [force]
+                                Set wallpaper (optionally for a specific workspace)
+  set-per-monitor [--workspace N] IMG1 IMG2 ... [MODE]
+                                Set per‑monitor wallpapers (optionally for a workspace)
+  random DIR [MODE]             Start random rotation (single image)
+  random-multi DIR [MODE]       Start random per‑monitor rotation
+  random-stop                   Stop random rotation
+  random-status                 Show random status
+  interval MINUTES              Set random rotation interval
+  refresh-start [MINUTES]       Start periodic refresh
+  refresh-stop                  Stop periodic refresh
+  refresh-status                Show refresh status
+  refresh-wallpaper             Manually reapply current wallpaper
+  status                        Show current settings and wallpaper
+  info IMAGE                    Show image info
+  preview IMAGE [MODE]          Generate a preview and open it
+  list-images DIR               List all images with dimensions
+  diagnose                      Run system diagnostics
+  daemon [--foreground|--oneshot]
+                                Start all background services (refresh + random)
+  daemon-stop                   Stop daemon
+  data-wipe                     Remove all ultraspan data (interactive)
+  set-config KEY VALUE          Update config directly
+  mode MODE                     Set default mode (zoom/fit/center)
+  bg-type TYPE                  Set bg type (blur/solid)
+  blur VALUE                    Set blur amount (0‑100)
+  color HEX                     Set solid color (e.g., #RRGGBB)
+  fullscreen [on/off]           Enable/disable auto‑pause on fullscreen
+  backend [gsettings|feh|nitrogen]
+                                Choose wallpaper setter
+  clean                         Clear cache
+  restore                       Restore default system wallpaper
+  generate-systemd              Print systemd service file
+  generate-completion           Print bash completion script
+  help                          Show this help
+  --version                     Show version
+
+WORKSPACES (requires per_workspace = true in config):
+  Use --workspace N to assign wallpapers to a specific workspace.
+  Without the flag, the wallpaper is saved for the current workspace.
+  Example:
+    ultraspan set --workspace 2 ~/Pics/space.jpg zoom
+    ultraspan set-per-monitor --workspace 3 img1.jpg img2.jpg img3.jpg
 
 EXAMPLES:
   ultraspan set ~/Pics/wall.jpg zoom
@@ -1030,6 +1087,9 @@ EOF
 # ----------------------------------------------------------------------
 main() {
     load_config
+    if [[ "${CONFIG[per_workspace]}" == "true" ]]; then
+        STATE_FILE="$(get_state_file)"
+    fi
     # Apply ImageMagick memory limit from config
     export MAGICK_MEMORY_LIMIT="${CONFIG[magick_memory]}"
 
@@ -1040,13 +1100,27 @@ main() {
 
     case "$cmd" in
         set)
-            [[ -z "$1" ]] && { log "ERROR" "Usage: set IMAGE [MODE] [force]"; exit 1; }
+            local workspace=""
+            if [[ "$1" == "--workspace" ]]; then
+                workspace="$2"; shift 2
+            fi
+            [[ -z "$1" ]] && { log "ERROR" "Usage: set [--workspace N] IMAGE [MODE] [force]"; exit 1; }
             local mode="${2:-${CONFIG[mode]}}"
             local force="${3:-false}"
+            if [[ -n "$workspace" ]]; then
+                STATE_FILE="$(get_state_file "$workspace")"
+            fi
             set_wallpaper "$1" "$mode" "$force"
             ;;
         set-per-monitor)
-            [[ $# -eq 0 ]] && { log "ERROR" "Usage: set-per-monitor IMG1 IMG2 ... [MODE]"; exit 1; }
+            local workspace=""
+            if [[ "$1" == "--workspace" ]]; then
+                workspace="$2"; shift 2
+            fi
+            [[ $# -eq 0 ]] && { log "ERROR" "Usage: set-per-monitor [--workspace N] IMG1 IMG2 ... [MODE]"; exit 1; }
+            if [[ -n "$workspace" ]]; then
+                STATE_FILE="$(get_state_file "$workspace")"
+            fi
             set_per_monitor_wallpaper "$@"
             ;;
         random)
