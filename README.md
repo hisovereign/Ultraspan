@@ -136,7 +136,17 @@ This will run the refresh command at launch and reapply current wallpaper every 
 
 4. gsettings tells Cinnamon to use this static file with picture-options=spanned.
 
-5. Auto-refresh resets wallpaper at set time intervals just in case  
+5. Auto-refresh resets wallpaper at set time intervals just in case
+
+#### Setting separate workspace wallpapers
+
+1. Set per_workspace=true in config
+
+2. Start daemon (stop and restart daemon)
+
+3. Move to specific workspace to set wallpapers or use --workspace in set command and 0-3 for workspace number
+
+
 #### Ultraspan cinnamon applet installation
 
 Copy the ultraspan@hisovereign folder and place it in ~/.local/share/cinnamon/applets
