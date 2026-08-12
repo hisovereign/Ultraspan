@@ -4,7 +4,7 @@
 
 Ultraspan is a command-line tool that aims to be a true workaround to the **blurry wallpaper bug** in Linux Mint Cinnamon when using multiple monitors. 
 
-It pre-renders the final image using ImageMagick, bypassing Cinnamon's caching and scaling, and can also re-apply wallpaper settings periodically. 
+It pre-renders the final image using ImageMagick, bypassing Cinnamon's caching and scaling; It can also re-apply wallpaper settings periodically and in the background. 
 
 Demo: https://youtu.be/hQV6NugUXEQ
 
