@@ -150,6 +150,16 @@ This will run the refresh command at launch and reapply current wallpaper every 
 
 3. Move to specific workspace to set wallpapers or use --workspace in set command and 0-3 for workspace number
 
+#### Installing graphical user interface
+
+dependencies needed for Debian/Ubuntu/Mint:
+```
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
+```
+1. download ultraspan_gui.py
+2. move it to ~/.local/bin
+3. make it executable by right-clicking> properties> permissions> checking allow executing file as program
+4. double-click and run
 
 #### Ultraspan cinnamon applet installation
 
