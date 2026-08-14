@@ -91,10 +91,6 @@ class UltraspanApplet extends Applet.IconApplet {
         this.menu.toggle();
     }
 
-    _protectFromBlur() {
-        // keep your existing implementation unchanged
-    }
-
     _addCustomStyles() {
         const css = `
             .ultraspan-submenu { max-width: 250px !important; min-width: 200px !important; }
@@ -104,8 +100,97 @@ class UltraspanApplet extends Applet.IconApplet {
         try { const style = new St.StyleSheet(); style.from_string(css); this.actor.add_style(style); } catch(e) {}
     }
 
+    _protectFromBlur() {
+        let applet = this;
+
+        function isOurMenu(menu) {
+            try {
+                let parent = menu.actor;
+                while (parent) {
+                    if (parent._delegate && parent._delegate._applet === applet) return true;
+                    parent = parent.get_parent();
+                }
+            } catch (e) {}
+            return false;
+        }
+
+        let processMenus = () => {
+            try {
+                let menus = [];
+                let findMenus = (actor) => {
+                    if (actor instanceof PopupMenu.PopupMenu) menus.push(actor);
+                    let children = actor.get_children();
+                    if (children) children.forEach(findMenus);
+                };
+                findMenus(Main.uiGroup);
+
+                menus.forEach(menu => {
+                    if (!isOurMenu(menu)) return;
+                    if (!applet._originalAllocate && menu.actor.allocate) {
+                        applet._originalAllocate = menu.actor.allocate;
+                        menu.actor.allocate = function(box, flags) {
+                            applet._originalAllocate.call(this, box, flags);
+                            if (this instanceof St.ScrollView) {
+                                this.queue_relayout();
+                                let vscroll = this.get_vscroll_bar();
+                                if (vscroll) vscroll.queue_relayout();
+                            }
+                        };
+                    }
+                    let fixScrollView = (actor) => {
+                        if (actor instanceof St.ScrollView) {
+                            actor.set_style('overflow-y: auto; max-height: 400px;');
+                            actor.queue_relayout();
+                        }
+                        let children = actor.get_children();
+                        if (children) children.forEach(fixScrollView);
+                    };
+                    fixScrollView(menu.actor);
+                });
+            } catch (e) {
+                global.log("Error in processMenus: " + e);
+            }
+        };
+
+        processMenus();
+        this._menuTimer = setInterval(processMenus, 500);
+        this._stageSignalId = global.stage.connect('notify::focus-key', () => {
+            this._setTimeout(processMenus, 50);
+        });
+    }
+
     _forceSubmenuStyles(menu) {
-        // keep unchanged
+        menu.connect('open-state-changed', (subMenu, open) => {
+            if (open) {
+                [10, 50, 100, 200].forEach(delay => {
+                    this._setTimeout(() => {
+                        try {
+                            let actor = subMenu.actor;
+                            if (actor instanceof imports.gi.St.ScrollView) {
+                                let [width, height] = actor.get_size();
+                                actor.set_height(-1);
+                                actor.set_width(-1);
+                                actor.queue_relayout();
+                                this._setTimeout(() => {
+                                    actor.set_height(height);
+                                    actor.set_width(width);
+                                    actor.queue_relayout();
+                                    let vscroll = actor.get_vscroll_bar();
+                                    if (vscroll) vscroll.queue_relayout();
+                                }, 5);
+                            }
+                            let parent = actor.get_parent();
+                            while (parent) {
+                                parent.queue_relayout();
+                                parent = parent.get_parent();
+                            }
+                        } catch (e) {
+                            global.log("Error forcing allocation: " + e);
+                        }
+                    }, delay);
+                });
+            }
+        });
     }
 
     _autoStartRefreshIfNeeded() {
@@ -654,20 +739,54 @@ class UltraspanApplet extends Applet.IconApplet {
                 obj.query_info_finish(res);
                 this._setTimeout(() => {
                     try {
-                        GLib.spawn_async(null, [SCRIPT_PATH].concat(args), null,
-                            GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.DO_NOT_REAP_CHILD, null);
-                    } catch(e) { global.logError("Error running command: " + e); }
+                        let [success, pid] = GLib.spawn_async(
+                            null,
+                            [SCRIPT_PATH].concat(args),
+                            null,
+                            GLib.SpawnFlags.SEARCH_PATH,
+                            null
+                        );
+                        if (success) {
+                            GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, () => {
+                                GLib.spawn_close_pid(pid);
+                                return false;
+                            });
+                        } else {
+                            global.logError("Failed to spawn ultraspan command: " + args.join(" "));
+                        }
+                    } catch (e) {
+                        global.logError("Error running command: " + e);
+                    }
                 }, 10);
-            } catch(e) {}
+            } catch (e) {}
         });
     }
 
     _setWallpaper(imagePath) {
-        this._readConfigAsync((cfg) => { let mode = cfg.mode || 'zoom'; this._runCommandInBackground(["set", imagePath, mode]); });
+        this._readConfigAsync((cfg) => {
+            let mode = cfg.mode || 'zoom';
+            this._runCommandInBackground(["set", imagePath, mode]);
+        });
     }
 
     _openFolderInFileManager(folderPath) {
-        try { GLib.spawn_async(null, ['xdg-open', folderPath], null, GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.DO_NOT_REAP_CHILD, null); } catch(e) {}
+        try {
+            let [success, pid] = GLib.spawn_async(
+                null,
+                ['xdg-open', folderPath],
+                null,
+                GLib.SpawnFlags.SEARCH_PATH,
+                null
+            );
+            if (success) {
+                GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, () => {
+                    GLib.spawn_close_pid(pid);
+                    return false;
+                });
+            }
+        } catch (e) {
+            global.logError("Error opening folder: " + e);
+        }
     }
 
     _truncateName(name, maxLength) {
