@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.1.2
+# Version 1.1.3
 # ============================================
 
 import sys
@@ -147,7 +147,7 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         self.app = app
         self.config = UltraspanConfig()
 
-        self.set_default_size(650, 850)
+        self.set_default_size(650, 860)
 
         self._updating_modes = False
         self.monitor_count = 0
@@ -175,6 +175,16 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         .wallpaper-child { padding: 0px; margin: 0px; }
         .wallpaper-child image { padding: 0px; margin: 0px; }
         .wallpaper-child label { padding-top: 0px; margin-top: 0px; }
+        .wallpaper-child {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            outline: none;
+        }
+        .wallpaper-child.selected {
+            outline: 2px solid @theme_selected_bg_color;
+            outline-offset: -2px;
+        }
         """)
 
         gtk['Gtk'].StyleContext.add_provider_for_display(
@@ -185,6 +195,7 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         self._build_pages()
         self._monitor_config()
         self.connect('notify::visible-page', self._on_visible_page_changed)
+        self._update_service_status()
 
     def _get_current_max_allowed(self):
         """Return the number of selections allowed for the active mode."""
@@ -220,19 +231,16 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         folder_group.set_title("Wallpaper Folder")
         wallpapers_page.add(folder_group)
 
-        folder_row = gtk['Adw'].ActionRow.new()
-        folder_row.set_title("Folder")
-        folder_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 0)
-        self.folder_label = gtk['Gtk'].Label.new(self.config.get('wallpaper_folder'))
-        self.folder_label.set_xalign(0.0)
-        self.folder_label.set_hexpand(True)
-        self.folder_choose_btn = gtk['Gtk'].Button.new_with_label("Choose…")
-        self.folder_choose_btn.connect('clicked', self._on_choose_folder_clicked)
-        folder_box.append(self.folder_label)
-        folder_box.append(self.folder_choose_btn)
-        folder_row.add_suffix(folder_box)
-        folder_row.set_activatable_widget(self.folder_choose_btn)
-        folder_group.add(folder_row)
+        # One single clickable button for the folder
+        self.folder_button = gtk['Gtk'].Button.new_with_label(self.config.get('wallpaper_folder'))
+        self.folder_button.set_halign(gtk['Gtk'].Align.FILL)
+        self.folder_button.set_hexpand(True)
+        self.folder_button.set_margin_start(8)
+        self.folder_button.set_margin_end(8)
+        self.folder_button.set_margin_top(4)
+        self.folder_button.set_margin_bottom(4)
+        self.folder_button.connect('clicked', self._on_choose_folder_clicked)
+        folder_group.add(self.folder_button)
 
         list_group = gtk['Adw'].PreferencesGroup.new()
         list_group.set_title("Images")
@@ -291,9 +299,12 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         self.wallpaper_flowbox.set_column_spacing(0)
         scrolled.set_child(self.wallpaper_flowbox)
 
-        mode_selector_row = gtk['Adw'].ActionRow.new()
-        mode_selector_row.set_title("Apply Mode")
+        # Mode buttons as header suffix of Images group
         mode_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 0)
+        mode_box.set_halign(gtk['Gtk'].Align.END)
+        mode_box.set_valign(gtk['Gtk'].Align.CENTER)
+        mode_box.set_margin_top(0)
+        mode_box.set_margin_bottom(0)
 
         self.mode_single_btn = gtk['Gtk'].ToggleButton.new_with_label("Wallpaper")
         self.mode_single_btn.add_css_class("suggested-action")
@@ -310,13 +321,32 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         mode_box.append(self.mode_per_monitor_btn)
         mode_box.append(self.mode_per_workspace_btn)
 
-        mode_selector_row.add_suffix(mode_box)
-        mode_selector_row.set_activatable_widget(mode_box)
-        list_group.add(mode_selector_row)
+        # Try to place as header suffix (libadwaita ≥1.1)
+        try:
+            list_group.set_header_suffix(mode_box)
+        except AttributeError:
+            # Fallback: add a custom header row with title and buttons
+            header_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 6)
+            header_box.set_margin_start(8)
+            header_box.set_margin_end(8)
+            header_box.set_margin_top(4)
+            header_box.set_margin_bottom(4)
+
+            title_label = gtk['Gtk'].Label.new("Images")
+            title_label.set_halign(gtk['Gtk'].Align.START)
+            title_label.set_hexpand(True)
+
+            mode_box.set_halign(gtk['Gtk'].Align.END)
+            header_box.append(title_label)
+            header_box.append(mode_box)
+
+            # Insert at the top of the group (before other children)
+            list_group.add(header_box)
+            # Move it to the first position
+            list_group.reorder_child_after(header_box, None)
 
         self.workspace_select_row = gtk['Adw'].ActionRow.new()
-        self.workspace_select_row.set_title("Workspace Number")
-        self.workspace_select_row.set_subtitle("Target workspace (0‑based)")
+        self.workspace_select_row.set_title("Workspace Number (0‑based)")
         workspace_spin = gtk['Gtk'].SpinButton.new_with_range(0, 20, 1)
         workspace_spin.set_value(0)
         workspace_spin.connect('value-changed', self._on_workspace_spin_changed)
@@ -331,20 +361,6 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         general_page.set_title("General")
         general_page.set_icon_name("preferences-system-symbolic")
         self.add(general_page)
-
-        backend_group = gtk['Adw'].PreferencesGroup.new()
-        backend_group.set_title("Wallpaper Backend")
-        general_page.add(backend_group)
-
-        backend_row = gtk['Adw'].ComboRow.new()
-        backend_row.set_title("Backend")
-        backend_row.set_subtitle("Tool used to set the wallpaper")
-        model = gtk['Gtk'].StringList.new(["gsettings", "feh", "nitrogen"])
-        backend_row.set_model(model)
-        backend_row.set_selected(self._get_index(model, self.config.get('backend')))
-        backend_row.connect('notify::selected', self._on_backend_changed)
-        backend_group.add(backend_row)
-        self.backend_row = backend_row
 
         mode_group = gtk['Adw'].PreferencesGroup.new()
         mode_group.set_title("Display Mode")
@@ -424,6 +440,20 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         workspace_row.connect('notify::active', self._on_workspace_toggled)
         general_settings_group.add(workspace_row)
         self.workspace_row = workspace_row
+
+        backend_group = gtk['Adw'].PreferencesGroup.new()
+        backend_group.set_title("Wallpaper Backend")
+        general_page.add(backend_group)
+
+        backend_row = gtk['Adw'].ComboRow.new()
+        backend_row.set_title("Backend")
+        backend_row.set_subtitle("Tool used to set the wallpaper")
+        model = gtk['Gtk'].StringList.new(["gsettings", "feh", "nitrogen"])
+        backend_row.set_model(model)
+        backend_row.set_selected(self._get_index(model, self.config.get('backend')))
+        backend_row.connect('notify::selected', self._on_backend_changed)
+        backend_group.add(backend_row)
+        self.backend_row = backend_row
 
         # Rotation page
         rotation_page = gtk['Adw'].PreferencesPage.new()
@@ -821,23 +851,12 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
         else:
             rgba.parse('#000000')
         self.color_btn.props.rgba = rgba
-        self.folder_label.set_text(self.config.get('wallpaper_folder'))
+        self.folder_button.set_label(self.config.get('wallpaper_folder'))
         self._populate_wallpaper_list_async()
         self.random_spin.set_value(self.config.get_int('random_interval'))
         self.multi_random_row.set_active(self.config.get_bool('multi_random'))
         self.refresh_spin.set_value(self.config.get_int('refresh_interval'))
         self._update_service_status()
-
-        # Update refresh buttons
-        self.refresh_start_btn.set_sensitive(not refresh_running)
-        self.refresh_stop_btn.set_sensitive(refresh_running)
-        self.refresh_start_btn.set_label("Start" if not refresh_running else "Running")
-        if refresh_running:
-            self.refresh_start_btn.remove_css_class("suggested-action")
-            self.refresh_start_btn.add_css_class("success")
-        else:
-            self.refresh_start_btn.remove_css_class("success")
-            self.refresh_start_btn.add_css_class("suggested-action")
 
     # ------------------------------------------------------------------
     # Signal handlers
@@ -917,7 +936,7 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
             return
         if folder:
             path = folder.get_path()
-            self.folder_label.set_text(path)
+            self.folder_label.set_label(path)
             self.config.set('wallpaper_folder', path)
             self._run_ultraspan_async(["set-config", "wallpaper_folder", path])
             self._populate_wallpaper_list_async()
