@@ -1,8 +1,10 @@
 #!/bin/bash
+set -u
+
 # ============================================
 # Ultraspan - Ultimate Multi‑Monitor Wallpaper Utility
 # ============================================
-# Version 5.3.2 - Brought to you by hisovereign
+# Version 5.3.3 - Brought to you by hisovereign
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -24,7 +26,7 @@ CONFIG[config_version]=1           # config version for migration
 CONFIG[per_workspace]="false"      # enable per‑workspace wallpapers
 
 
-VERSION="5.3.1"
+VERSION="5.3.3"
 CONFIG_DIR="${HOME}/.config/ultraspan"
 CONFIG_FILE="${CONFIG_DIR}/config"
 CACHE_DIR="${HOME}/.cache/ultraspan"
@@ -40,6 +42,7 @@ DAEMON_PIDFILE="${PID_DIR}/daemon.pid"
 
 DEBUG=false
 VERBOSE=false
+WATCHDOG_LIMIT=1000000
 
 # ----------------------------------------------------------------------
 # ImageMagick detection & memory limit
@@ -409,6 +412,74 @@ set_wallpaper() {
     log "INFO" "Wallpaper set successfully."
 }
 
+_create_background_canvas() {
+    local first_image="$1"
+    local canvas
+    canvas="$(mktemp --suffix=.png)" || { log "ERROR" "Cannot create canvas"; return 1; }
+    if [[ "${CONFIG[bg_type]}" == "blur" ]]; then
+        $IM_CMD "$first_image" -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -blur "0x${CONFIG[blur]}" "$canvas"
+    else
+        $IM_CMD -size "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" "xc:${CONFIG[color]}" "$canvas"
+    fi
+    echo "$canvas"
+}
+
+_process_monitor_images_parallel() {
+    local mode="$1"; shift
+    local -a imgs=("$@")
+    local -a outfiles
+    local -a pids
+    local i
+
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local outfile
+        outfile="$(mktemp)" || { log "ERROR" "mktemp failed"; return 1; }
+        process_image_for_area "${imgs[i]}" "${MONITOR_W[i]}" "${MONITOR_H[i]}" "${mode}" > "$outfile" &
+        pids+=("$!")
+        outfiles+=("$outfile")
+    done
+    wait "${pids[@]}"
+
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local path_from_file
+        path_from_file="$(cat "${outfiles[i]}")"
+        if [[ -z "$path_from_file" ]] || [[ ! -f "$path_from_file" ]]; then
+            log "ERROR" "Failed to process image for monitor $i"
+            return 1
+        fi
+        outfiles[i]="$path_from_file"
+    done
+
+    printf '%s\n' "${outfiles[@]}"
+}
+
+_compose_per_monitor_canvas() {
+    local mode="$1"; shift
+    local canvas="$1"; shift
+    local -a procs=("$@")
+    local i
+
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local proc="${procs[i]}"
+        local mon_x="${MONITOR_X[i]}" mon_y="${MONITOR_Y[i]}"
+        local mon_w="${MONITOR_W[i]}" mon_h="${MONITOR_H[i]}"
+        local img_w img_h
+        img_w="$($IM_IDENTIFY -format "%w" "$proc")"
+        img_h="$($IM_IDENTIFY -format "%h" "$proc")"
+
+        if [[ "$mode" == "zoom" ]]; then
+            $IM_CMD "$canvas" "$proc" -geometry +"${mon_x}"+"${mon_y}" -composite "$canvas"
+        else
+            local offset_x=$(( mon_x + (mon_w - img_w) / 2 ))
+            local offset_y=$(( mon_y + (mon_h - img_h) / 2 ))
+            (( offset_x < mon_x )) && offset_x="$mon_x"
+            (( offset_y < mon_y )) && offset_y="$mon_y"
+            $IM_CMD "$canvas" "$proc" -geometry +"${offset_x}+${offset_y}" -composite "$canvas"
+        fi
+        rm -f "$proc"
+    done
+}
+
 # ----------------------------------------------------------------------
 # Per‑monitor wallpaper (parallel)
 # ----------------------------------------------------------------------
@@ -434,6 +505,7 @@ set_per_monitor_wallpaper() {
         safe_abs="$(safe_filename "$abs_img")"
         key_string="${key_string}|${safe_abs}|$(get_file_mtime "$abs_img")"
     done
+
     local cache_key
     cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
     local CACHE_FILE="${CACHE_DIR}/${cache_key}.jpg"
@@ -442,54 +514,13 @@ set_per_monitor_wallpaper() {
 
     if [[ ! -f "$CACHE_FILE" ]]; then
         log "INFO" "Processing per‑monitor images in parallel..."
+
         local bg_canvas
-        bg_canvas="$(mktemp --suffix=.png)" || { log "ERROR" "Cannot create canvas"; return 1; }
-        if [[ "${CONFIG[bg_type]}" == "blur" ]]; then
-            $IM_CMD "${images[0]}" -resize "${TOTAL_WIDTH}x${TOTAL_HEIGHT}^" -gravity center -extent "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" -blur "0x${CONFIG[blur]}" "$bg_canvas"
-        else
-            $IM_CMD -size "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" "xc:${CONFIG[color]}" "$bg_canvas"
-        fi
+        bg_canvas="$(_create_background_canvas "${images[0]}")" || return 1
 
-        local temp_files=()
-        local pids=()
-        for i in $(seq 0 $((MONITOR_COUNT-1))); do
-            local outfile
-            outfile="$(mktemp)" || { log "ERROR" "mktemp failed"; return 1; }
-            temp_files+=("$outfile")
-            process_image_for_area "${images[i]}" "${MONITOR_W[i]}" "${MONITOR_H[i]}" "$mode" > "$outfile" &
-            pids+=("$!")
-        done
-        wait "${pids[@]}"
-
-        # Read the true processed image paths
-        for i in $(seq 0 $((MONITOR_COUNT-1))); do
-            local path_from_file
-            path_from_file="$(cat "${temp_files[i]}")"
-            if [[ -z "$path_from_file" ]] || [[ ! -f "$path_from_file" ]]; then
-                log "ERROR" "Failed to process image for monitor $i"
-                return 1
-            fi
-            temp_files[i]="$path_from_file"
-        done
-
-        for i in $(seq 0 $((MONITOR_COUNT-1))); do
-            local proc="${temp_files[i]}"
-            local mon_x="${MONITOR_X[i]}" mon_y="${MONITOR_Y[i]}"
-            local mon_w="${MONITOR_W[i]}" mon_h="${MONITOR_H[i]}"
-            local img_w img_h
-            img_w="$($IM_IDENTIFY -format "%w" "$proc")"
-            img_h="$($IM_IDENTIFY -format "%h" "$proc")"
-            if [[ "$mode" == "zoom" ]]; then
-                $IM_CMD "$bg_canvas" "$proc" -geometry +"${mon_x}"+"${mon_y}" -composite "$bg_canvas"
-            else
-                local offset_x=$(( mon_x + (mon_w - img_w) / 2 ))
-                local offset_y=$(( mon_y + (mon_h - img_h) / 2 ))
-                (( offset_x < mon_x )) && offset_x="$mon_x"
-                (( offset_y < mon_y )) && offset_y="$mon_y"
-                $IM_CMD "$bg_canvas" "$proc" -geometry +"${offset_x}+${offset_y}" -composite "$bg_canvas"
-            fi
-            rm -f "$proc"
-        done
+        local -a processed
+        readarray -t processed < <(_process_monitor_images_parallel "$mode" "${images[@]}")
+        _compose_per_monitor_canvas "$mode" "$bg_canvas" "${processed[@]}"
 
         $IM_CMD "$bg_canvas" -quality 95 "$CACHE_FILE"
         rm -f "$bg_canvas"
@@ -549,8 +580,9 @@ refresh_wallpaper() {
     fi
 
     if [[ "$recent_line" =~ ^per-monitor:(.*) ]]; then
-        local imgs="${BASH_REMATCH[1]}"
-        IFS='|' read -ra img_array <<< "$imgs"
+        local pm_list="${BASH_REMATCH[1]}"
+        local -a img_array
+        IFS='|' read -ra img_array <<< "$pm_list"
         set_per_monitor_wallpaper "${img_array[@]}" "$mode"
     else
         local recent_image="$recent_line"
@@ -610,13 +642,16 @@ start_random_mode() {
     first_image="$(pick_random_image "$directory")" || return 1
     set_wallpaper "$first_image" "$mode"
     (
-        while true; do
+        local iterations=0
+        while (( iterations < WATCHDOG_LIMIT )); do
+            ((iterations++))
             sleep $((interval * 60))
             [[ -f "$RANDOM_FILE" ]] || exit 0
             local new_img
             new_img="$(pick_random_image "$directory")" || continue
             set_wallpaper "$new_img" "$mode"
         done
+        log "ERROR" "Random rotation loop exceeded watchdog limit. Exiting."
     ) &
     echo $! >> "$RANDOM_FILE"
     log "INFO" "Random rotation started (PID $!)"
@@ -667,13 +702,16 @@ start_random_multi_mode() {
     set_per_monitor_wallpaper "${first_set[@]}" "$mode"
 
     (
-        while true; do
+        local iterations=0
+        while (( iterations < WATCHDOG_LIMIT )); do
+            ((iterations++))
             sleep $((interval * 60))
             [[ -f "$RANDOM_FILE" ]] || exit 0
             local new_set
             readarray -t new_set < <(pick_random_set)
             set_per_monitor_wallpaper "${new_set[@]}" "$mode"
         done
+        log "ERROR" "Random multi rotation loop exceeded watchdog limit. Exiting."
     ) &
     echo $! >> "$RANDOM_FILE"
     log "INFO" "Random multi rotation started (PID $!)"
@@ -708,12 +746,15 @@ start_refresh_mode() {
     } > "$REFRESH_FILE"
 
     do_refresh() {
-        while true; do
+        local iterations=0
+        while (( iterations < WATCHDOG_LIMIT )); do
+            ((iterations++))
             sleep $((interval * 60))
             [[ -f "$REFRESH_FILE" ]] || exit 0
             log "INFO" "Auto-refreshing wallpaper"
             refresh_wallpaper
         done
+        log "ERROR" "Refresh loop exceeded watchdog limit. Exiting."
     }
 
     do_refresh &
@@ -752,7 +793,9 @@ stop_refresh_mode() {
 # ----------------------------------------------------------------------
 monitor_fullscreen() {
     local was_fullscreen=false
-    while true; do
+    local iterations=0
+    while (( iterations < WATCHDOG_LIMIT )); do
+        ((iterations++))
         sleep 2
         if is_fullscreen_active; then
             if [[ "$was_fullscreen" == false ]]; then
@@ -776,11 +819,14 @@ monitor_fullscreen() {
             fi
         fi
     done
+    log "ERROR" "Fullscreen monitor exceeded watchdog limit. Exiting."
 }
 
 monitor_layout() {
     local last_layout=""
-    while true; do
+    local iterations=0
+    while (( iterations < WATCHDOG_LIMIT )); do
+        ((iterations++))
         sleep 2
         local current_layout
         current_layout="$(xrandr --current --listmonitors 2>/dev/null | md5sum | cut -d' ' -f1)"
@@ -790,6 +836,7 @@ monitor_layout() {
         fi
         last_layout="$current_layout"
     done
+    log "ERROR" "Layout monitor exceeded watchdog limit. Exiting."
 }
 
 # ----------------------------------------------------------------------
@@ -798,7 +845,9 @@ monitor_layout() {
 monitor_workspace() {
     sleep 2
     local last_ws=""
-    while true; do
+    local iterations=0
+    while (( iterations < WATCHDOG_LIMIT )); do
+        ((iterations++))
         load_config
         local new_ws
         new_ws="$(xdotool get_desktop 2>/dev/null || echo 0)"
@@ -810,6 +859,7 @@ monitor_workspace() {
         fi
         sleep 1
     done
+    log "ERROR" "Workspace monitor exceeded watchdog limit. Exiting."
 }
 
 # ----------------------------------------------------------------------
@@ -840,7 +890,12 @@ start_daemon() {
             echo "$$" > "$DAEMON_PIDFILE"
             start_refresh_mode "${CONFIG[refresh_interval]}"
             start_saved_random
-            while true; do sleep 3600; done
+            local iterations=0
+            while (( iterations < WATCHDOG_LIMIT )); do
+                ((iterations++))
+                sleep 3600
+            done
+            log "ERROR" "Daemon idle loop exceeded watchdog limit. Exiting."
             ;;
         oneshot)
             echo "$$" > "$DAEMON_PIDFILE"
@@ -855,7 +910,12 @@ start_daemon() {
                 echo "$BASHPID" > "$DAEMON_PIDFILE"
                 start_refresh_mode "${CONFIG[refresh_interval]}"
                 start_saved_random
-                while true; do sleep 3600; done
+                local iterations=0
+                while (( iterations < WATCHDOG_LIMIT )); do
+                    ((iterations++))
+                    sleep 3600
+                done
+                log "ERROR" "Daemon idle loop exceeded watchdog limit. Exiting."
             ) &
             disown
             log "INFO" "Daemon sent to background."
