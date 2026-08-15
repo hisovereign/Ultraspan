@@ -936,7 +936,7 @@ class UltraspanWindow(ensure_gtk()['Adw'].PreferencesWindow):
             return
         if folder:
             path = folder.get_path()
-            self.folder_label.set_label(path)
+            self.folder_button.set_label(path)
             self.config.set('wallpaper_folder', path)
             self._run_ultraspan_async(["set-config", "wallpaper_folder", path])
             self._populate_wallpaper_list_async()
