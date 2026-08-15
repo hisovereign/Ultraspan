@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan - Ultimate Multi‑Monitor Wallpaper Utility
 # ============================================
-# Version 5.3.1 - Brought to you by hisovereign
+# Version 5.3.2 - Brought to you by hisovereign
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -241,7 +241,7 @@ get_total_span() {
 # Filename safety: replace pipe character
 # ----------------------------------------------------------------------
 safe_filename() {
-    echo "$1" | sed 's/|/%PIPE%/g'
+    printf '%s\n' "${1//|/%PIPE%}"
 }
 
 # ----------------------------------------------------------------------
@@ -306,7 +306,8 @@ set_wallpaper() {
     abs_image="$(readlink -f "$image")"
     local mtime
     mtime="$(get_file_mtime "$abs_image")"
-    local safe_abs="$(safe_filename "$abs_image")"
+    local safe_abs
+    safe_abs="$(safe_filename "$abs_image")"
     local key_string="${safe_abs}|${mtime}|${mode}|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
     local cache_key
     cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
@@ -390,7 +391,7 @@ set_wallpaper() {
         else
             echo "${CONFIG[color]}"
         fi
-        echo "$(date '+%Y-%m-%d %H:%M:%S')"
+        date '+%Y-%m-%d %H:%M:%S'
     } > "$STATE_FILE"
 
     case "${CONFIG[backend]}" in
@@ -456,7 +457,7 @@ set_per_monitor_wallpaper() {
             outfile="$(mktemp)" || { log "ERROR" "mktemp failed"; return 1; }
             temp_files+=("$outfile")
             process_image_for_area "${images[i]}" "${MONITOR_W[i]}" "${MONITOR_H[i]}" "$mode" > "$outfile" &
-            pids+=($!)
+            pids+=("$!")
         done
         wait "${pids[@]}"
 
@@ -479,13 +480,13 @@ set_per_monitor_wallpaper() {
             img_w="$($IM_IDENTIFY -format "%w" "$proc")"
             img_h="$($IM_IDENTIFY -format "%h" "$proc")"
             if [[ "$mode" == "zoom" ]]; then
-                $IM_CMD "$bg_canvas" "$proc" -geometry +${mon_x}+${mon_y} -composite "$bg_canvas"
+                $IM_CMD "$bg_canvas" "$proc" -geometry +"${mon_x}"+"${mon_y}" -composite "$bg_canvas"
             else
                 local offset_x=$(( mon_x + (mon_w - img_w) / 2 ))
                 local offset_y=$(( mon_y + (mon_h - img_h) / 2 ))
                 (( offset_x < mon_x )) && offset_x="$mon_x"
                 (( offset_y < mon_y )) && offset_y="$mon_y"
-                $IM_CMD "$bg_canvas" "$proc" -geometry +${offset_x}+${offset_y} -composite "$bg_canvas"
+                $IM_CMD "$bg_canvas" "$proc" -geometry +"${offset_x}+${offset_y}" -composite "$bg_canvas"
             fi
             rm -f "$proc"
         done
@@ -504,7 +505,7 @@ set_per_monitor_wallpaper() {
         echo "$mode"
         echo "${CONFIG[bg_type]}"
         if [[ "${CONFIG[bg_type]}" == "blur" ]]; then echo "${CONFIG[blur]}"; else echo "${CONFIG[color]}"; fi
-        echo "$(date '+%Y-%m-%d %H:%M:%S')"
+        date '+%Y-%m-%d %H:%M:%S'
     } > "$STATE_FILE"
 
     case "${CONFIG[backend]}" in
@@ -645,23 +646,32 @@ start_random_multi_mode() {
         local selected=() indices=()
         while [[ ${#indices[@]} -lt $N ]]; do
             local idx=$((RANDOM % ${#images[@]}))
-            if [[ ! " ${indices[@]} " =~ " ${idx} " ]]; then
-                indices+=($idx)
+            local already_present=false
+            local existing
+            for existing in "${indices[@]}"; do
+                if [[ "$existing" == "$idx" ]]; then
+                    already_present=true
+                    break
+                fi
+            done
+            if [[ "$already_present" == false ]]; then
+                indices+=("$idx")
             fi
         done
         for idx in "${indices[@]}"; do selected+=("${images[$idx]}"); done
-        echo "${selected[@]}"
+        printf '%s\n' "${selected[@]}"
     }
 
     local first_set
-    first_set=($(pick_random_set))
+    readarray -t first_set < <(pick_random_set)
     set_per_monitor_wallpaper "${first_set[@]}" "$mode"
+
     (
         while true; do
             sleep $((interval * 60))
             [[ -f "$RANDOM_FILE" ]] || exit 0
             local new_set
-            new_set=($(pick_random_set))
+            readarray -t new_set < <(pick_random_set)
             set_per_monitor_wallpaper "${new_set[@]}" "$mode"
         done
     ) &
@@ -881,7 +891,7 @@ start_saved_random() {
 data_wipe_ultraspan() {
     echo "This will remove ALL ultraspan configuration, cache, and state files."
     echo "Your wallpapers will be reset to the system default."
-    read -p "Are you sure? (y/N) " confirm
+    read -r -p "Are you sure? (y/N) " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "Aborted."
         return 0
@@ -934,7 +944,6 @@ preview_wallpaper() {
     local image="$1" mode="${2:-${CONFIG[mode]}}"
     [[ -f "$image" ]] || { log "ERROR" "File not found: $image"; return 1; }
     get_total_span
-    local preview_file="/tmp/ultraspan_preview.jpg"
     local scale="800"
     if [[ $TOTAL_WIDTH -gt $TOTAL_HEIGHT ]]; then
         scale_w=$scale
@@ -990,7 +999,7 @@ diagnose() {
         echo "  ${MONITOR_NAMES[i]}: ${MONITOR_W[i]}x${MONITOR_H[i]} at ${MONITOR_X[i]},${MONITOR_Y[i]}"
     done
     echo "Cache: $(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)"
-    echo "State file: $(cat "$STATE_FILE" 2>/dev/null | head -1)"
+    echo "State file: $(head -n1 "$STATE_FILE" 2>/dev/null)"
     if [[ -f "$REFRESH_FILE" ]]; then
         echo "Refresh: active (PID $(tail -n1 "$REFRESH_FILE"))"
     else
@@ -1284,7 +1293,10 @@ main() {
             if [[ -z "$1" ]]; then
                 echo "Blur: ${CONFIG[blur]}"
             else
-                [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 0 ]] && [[ "$1" -le 100 ]] || { log "ERROR" "Blur must be 0-100"; exit 1; }
+                if ! [[ "$1" =~ ^[0-9]+$ ]] || ! [[ "$1" -ge 0 ]] || ! [[ "$1" -le 100 ]]; then
+                    log "ERROR" "Blur must be 0-100"
+                    exit 1
+                fi
                 update_config blur "$1"
                 if [[ -f "$STATE_FILE" ]] && [[ "${CONFIG[bg_type]}" == "blur" ]]; then
                     local recent_image mode
@@ -1344,7 +1356,11 @@ main() {
             else
                 local alt
                 alt="$(find /usr/share/backgrounds /usr/share/wallpapers -name "*.jpg" -o -name "*.png" | head -1)"
-                [[ -n "$alt" ]] && set_wallpaper "$alt" "zoom" || log "ERROR" "No system wallpaper found"
+                if [[ -n "$alt" ]]; then
+                    set_wallpaper "$alt" "zoom"
+                else
+                    log "ERROR" "No system wallpaper found"
+                fi
             fi
             ;;
         generate-systemd)
