@@ -1195,6 +1195,11 @@ main() {
     local cmd="${1:-help}"
     shift || true
 
+    # Ensure positional parameters are always defined under set -u
+    if (( $# == 0 )); then
+        set -- ""
+    fi
+
     case "$cmd" in
         set)
             local workspace=""
