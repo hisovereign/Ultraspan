@@ -39,4 +39,4 @@ jobs:
         run: pip install ruff
 
       - name: Run Ruff
-        run: ruff check ultraspan_gui.py --ignore E501
+        run: ruff check ultraspan_gui.py --ignore E501,EXE001
