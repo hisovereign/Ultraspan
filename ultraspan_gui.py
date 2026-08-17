@@ -2,21 +2,21 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.1.5
+# Version 1.1.6
 # ============================================
 
 from __future__ import annotations
 
-import sys
+import hashlib
 import os
 import subprocess
+import sys
 import threading
-import hashlib
 
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Gio, GLib, Adw, Gdk, GdkPixbuf
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 # ----------------------------------------------------------------------
 # GTK module dictionary (initialised at import time, no lazy loading)
@@ -83,8 +83,7 @@ class UltraspanConfig:
     def save(self) -> None:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_FILE, 'w') as f:
-            for key, val in self.values.items():
-                f.write(f"{key}={val}\n")
+            f.writelines(f"{key}={val}\n" for key, val in self.values.items())
 
     def get(self, key: str) -> str:
         return self.values.get(key, self.defaults.get(key, ''))
@@ -615,7 +614,8 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 [SCRIPT_PATH] + args,
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=120,
+                check=False
             )
             return result.stdout.strip(), result.stderr.strip(), result.returncode
         except subprocess.TimeoutExpired as e:
@@ -662,13 +662,13 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 if os.path.exists(thumb_path):
                     try:
                         pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
-                    except Exception:
+                    except gtk['GLib'].Error:
                         continue
                 else:
                     try:
                         pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file_at_scale(path, 134, 134, True)
                         pixbuf.savev(thumb_path, 'png', [], [])
-                    except Exception:
+                    except (gtk['GLib'].Error, OSError):
                         continue
                 gtk['GLib'].idle_add(self._add_thumbnail_to_flowbox, path, pixbuf, idx)
 
@@ -737,7 +737,13 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             self.monitor_list_box.remove(child)
 
         try:
-            result = subprocess.run(['xrandr', '--listmonitors'], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(
+                ['xrandr', '--listmonitors'],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False
+            )
             lines = result.stdout.splitlines()
             monitors = []
             for line in lines[1:]:
@@ -932,7 +938,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         dialog.select_folder(self, None, self._on_folder_dialog_response)
 
     def _on_refresh_images_clicked(self, btn: object) -> None:
-        gtk = GTK
 
         self.selected_slots = [None] * self._get_current_max_allowed()
 
