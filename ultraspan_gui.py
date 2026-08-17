@@ -333,11 +333,23 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         mode_box.append(self.mode_per_monitor_btn)
         mode_box.append(self.mode_per_workspace_btn)
 
-        # Try to place as header suffix (libadwaita ≥1.1)
-        try:
-            list_group.set_header_suffix(mode_box)
-        except AttributeError:
-            # Fallback: add a custom header row with title and buttons
+        # Modern header suffix (libadwaita ≥1.1)
+        # Fallback for older versions: create a header row manually.
+        use_fallback = os.environ.get('ULTRASPAN_FORCE_FALLBACK') == '1'
+
+        if use_fallback:
+            header_suffix_available = False
+        else:
+            header_suffix_available = hasattr(list_group, 'set_header_suffix')
+
+        if header_suffix_available:
+            try:
+                list_group.set_header_suffix(mode_box)
+            except AttributeError:
+                header_suffix_available = False
+
+        if not header_suffix_available:
+            # Manual fallback header row
             header_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 6)
             header_box.set_margin_start(8)
             header_box.set_margin_end(8)
@@ -352,10 +364,8 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             header_box.append(title_label)
             header_box.append(mode_box)
 
-            # Insert at the top of the group (before other children)
+            # Add the header row to the group (appears at the end of existing children,
             list_group.add(header_box)
-            # Move it to the first position
-            list_group.reorder_child_after(header_box, None)
 
         self.workspace_select_row = gtk['Adw'].ActionRow.new()
         self.workspace_select_row.set_title("Workspace Number (0‑based)")
