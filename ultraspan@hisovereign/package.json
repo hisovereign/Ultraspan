@@ -1,0 +1,12 @@
+{
+  "name": "ultraspan-applet",
+  "version": "1.0.0",
+  "description": "Ultraspan Cinnamon applet",
+  "main": "applet.js",
+  "scripts": {
+    "lint": "eslint applet.js"
+  },
+  "devDependencies": {
+    "eslint": "^10.9.0"
+  }
+}
