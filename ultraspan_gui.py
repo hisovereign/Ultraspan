@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.1.6
+# Version 1.1.7
 # ============================================
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ gi.require_version('Adw', '1')
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 # ----------------------------------------------------------------------
-# GTK module dictionary (initialised at import time, no lazy loading)
+# GTK module dictionary (initialised at import time)
 # ----------------------------------------------------------------------
 GTK = {
     'Gtk': Gtk,
@@ -43,6 +43,7 @@ REFRESH_FILE = os.path.join(CONFIG_DIR, 'refresh')
 SCRIPT_PATH = os.path.expanduser('~/.local/bin/ultraspan')
 DEFAULT_FOLDER = os.path.expanduser('~/Pictures/ultraspan')
 THUMBNAIL_CACHE = os.path.expanduser('~/.cache/ultraspan/thumbnails')
+DAEMON_PID_FILE = os.path.join('/run/user', str(os.getuid()), 'ultraspan', 'daemon.pid')
 
 # ----------------------------------------------------------------------
 # Config handler
@@ -217,6 +218,18 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 detail = stderr.strip() if stderr.strip() else f"Exit code {returncode}"
                 self.status_label.set_text(f"Diagnostics failed:\n{detail}")
 
+    def _is_daemon_running(self) -> bool:
+        """Return True if the daemon PID file exists and the process is alive."""
+        if not os.path.exists(DAEMON_PID_FILE):
+            return False
+        try:
+            with open(DAEMON_PID_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)   # signal 0 just checks existence
+            return True
+        except (OSError, ValueError):
+            return False
+
     # ------------------------------------------------------------------
     # Page dispatcher
     # ------------------------------------------------------------------
@@ -356,12 +369,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             header_box.set_margin_top(4)
             header_box.set_margin_bottom(4)
 
-            title_label = gtk['Gtk'].Label.new("Images")
-            title_label.set_halign(gtk['Gtk'].Align.START)
-            title_label.set_hexpand(True)
-
             mode_box.set_halign(gtk['Gtk'].Align.END)
-            header_box.append(title_label)
             header_box.append(mode_box)
 
             # Add the header row to the group (appears at the end of existing children,
@@ -477,6 +485,20 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         backend_group.add(backend_row)
         self.backend_row = backend_row
 
+        daemon_group = gtk['Adw'].PreferencesGroup.new()
+        daemon_group.set_title("Daemon")
+        daemon_group.set_description("Background services for per‑workspace, refresh, and random")
+        general_page.add(daemon_group)
+
+        self.daemon_switch = gtk['Adw'].SwitchRow.new()
+        self.daemon_switch.set_title("Run background daemon")
+        self.daemon_switch.set_subtitle("Required for per‑workspace wallpapers and periodic services")
+        self.daemon_switch.set_active(self._is_daemon_running())
+        self.daemon_switch.connect('notify::active', self._on_daemon_toggled)
+        daemon_group.add(self.daemon_switch)
+
+
+
     def _build_rotation_page(self, gtk: dict[str, object]) -> None:
         # Rotation page
         rotation_page = gtk['Adw'].PreferencesPage.new()
@@ -520,25 +542,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             self._on_refresh_interval_changed
         )
         refresh_group.add(refresh_interval_row)
-
-        self.refresh_daemon_switch = gtk['Adw'].SwitchRow.new()
-        self.refresh_daemon_switch.set_title("Control")
-        self.refresh_daemon_switch.set_subtitle("Start or stop the periodic refresh daemon")
-        self.refresh_daemon_switch.set_active(False)
-        self.refresh_daemon_switch.connect('notify::active', self._on_refresh_daemon_toggled)
-        refresh_group.add(self.refresh_daemon_switch)
-
-        refresh_now_row = gtk['Adw'].ActionRow.new()
-        refresh_now_row.set_title("Manual Refresh")
-        refresh_now_row.set_subtitle("Re‑apply current wallpaper immediately")
-        self.refresh_now_btn = gtk['Gtk'].Button.new_from_icon_name("view-refresh-symbolic")
-        self.refresh_now_btn.set_tooltip_text("Re-apply current wallpaper immediately")
-
-        self.refresh_now_btn.add_css_class("suggested-action")
-        self.refresh_now_btn.connect('clicked', self._on_refresh_now)
-        refresh_now_row.add_suffix(self.refresh_now_btn)
-        refresh_now_row.set_activatable_widget(self.refresh_now_btn)
-        refresh_group.add(refresh_now_row)
 
     def _build_status_page(self, gtk: dict[str, object]) -> None:
         # Status page
@@ -1002,28 +1005,25 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             self._run_ultraspan_async(["random-stop"])
         gtk['GLib'].timeout_add(500, self._update_service_status)
 
-    def _on_refresh_daemon_toggled(self, switch: object, *args: object) -> None:
-        active = switch.get_active()
-        gtk = GTK
-        if active:
-            interval = self.config.get_int('refresh_interval')
-            self._run_ultraspan_async(["refresh-start", str(interval)])
-        else:
-            self._run_ultraspan_async(["refresh-stop"])
-        gtk['GLib'].timeout_add(500, self._update_service_status)
-
-    def _on_refresh_now(self, btn: object, *args: object) -> None:
-        self._run_ultraspan_async(["refresh-wallpaper"])
-        btn.set_sensitive(False)
-        gtk = GTK
-        gtk['GLib'].timeout_add(1000, lambda: btn.set_sensitive(True))
 
     def _update_service_status(self) -> None:
         random_running = os.path.exists(RANDOM_FILE)
-        refresh_running = os.path.exists(REFRESH_FILE)
+        daemon_running = self._is_daemon_running()
 
         self.random_daemon_switch.set_active(random_running)
-        self.refresh_daemon_switch.set_active(refresh_running)
+        if hasattr(self, 'daemon_switch'):
+            self.daemon_switch.set_active(daemon_running)
+
+    def _on_daemon_toggled(self, row: object, *args: object) -> None:
+        val = row.get_active()
+        gtk = GTK
+        if val:
+            self._run_ultraspan_async(["daemon"])
+        else:
+            self._run_ultraspan_async(["daemon-stop"])
+        # Update all service switches after daemon start/stop
+        gtk['GLib'].timeout_add(2000, self._update_service_status)
+        gtk['GLib'].timeout_add(5000, self._update_service_status)
 
     # ------------------------------------------------------------------
     # Config monitor
