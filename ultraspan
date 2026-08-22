@@ -772,10 +772,8 @@ start_refresh_mode() {
         echo $! > "$LAYOUT_MONITOR_PIDFILE"
     fi
 
-    if [[ "${CONFIG[per_workspace]}" == "true" ]]; then
-        monitor_workspace &
-        echo $! >> "$LAYOUT_MONITOR_PIDFILE"   # reuse the same file or create a new one
-    fi
+    monitor_workspace &
+    echo $! >> "$LAYOUT_MONITOR_PIDFILE"
 }
 
 stop_refresh_mode() {
@@ -852,9 +850,11 @@ monitor_workspace() {
         local new_ws
         new_ws="$(xdotool get_desktop 2>/dev/null || echo 0)"
         if [[ "$new_ws" != "$last_ws" ]]; then
-            log "INFO" "Workspace changed to $new_ws"
-            STATE_FILE="$(get_state_file "$new_ws")"
-            refresh_wallpaper
+            if [[ "${CONFIG[per_workspace]}" == "true" ]]; then
+                log "INFO" "Workspace changed to $new_ws"
+                STATE_FILE="$(get_state_file "$new_ws")"
+                refresh_wallpaper
+            fi
             last_ws="$new_ws"
         fi
         sleep 1
