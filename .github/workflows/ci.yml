@@ -40,3 +40,21 @@ jobs:
 
       - name: Run Ruff
         run: ruff check ultraspan_gui.py --ignore E501,EXE001
+
+  eslint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ESLint
+        working-directory: ultraspan@hisovereign
+        run: npm install
+
+      - name: Run ESLint
+        working-directory: ultraspan@hisovereign
+        run: npm run lint
