@@ -33,6 +33,7 @@ function _(text) {
 class UltraspanApplet extends Applet.IconApplet {
     constructor(metadata, orientation, panelHeight, instanceId) {
         super(orientation, panelHeight, instanceId);
+        this._assert(!this._destroyed, "Applet already destroyed");
         this._destroyed = false;
 
         this.set_applet_icon_symbolic_name("preferences-desktop-wallpaper-symbolic");
@@ -42,8 +43,6 @@ class UltraspanApplet extends Applet.IconApplet {
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menuManager.addMenu(this.menu);
 
-        this._menuTimer = null;
-        this._stageSignalId = null;
         this._timeoutIds = [];
 
         // Slider & switch references
@@ -64,21 +63,11 @@ class UltraspanApplet extends Applet.IconApplet {
         this._refreshStartStopItem = null;
 
         this._buildMenu();
-
-        this._originalAllocate = null;
-        this._protectFromBlur();
     }
 
     on_applet_removed_from_panel() {
+        this._assert(!this._destroyed, "Already removed");
         this._destroyed = true;
-        if (this._menuTimer) {
-            clearInterval(this._menuTimer);
-            this._menuTimer = null;
-        }
-        if (this._stageSignalId) {
-            global.stage.disconnect(this._stageSignalId);
-            this._stageSignalId = null;
-        }
         this._timeoutIds.forEach(id => clearTimeout(id));
         this._timeoutIds = [];
         if (this.menu) {
@@ -87,6 +76,12 @@ class UltraspanApplet extends Applet.IconApplet {
         }
         if (this.menuManager) {
             this.menuManager = null;
+        }
+    }
+
+    _assert(condition, message) {
+        if (!condition) {
+            global.logError("UltraspanApplet assertion failed: " + message);
         }
     }
 
@@ -103,135 +98,120 @@ class UltraspanApplet extends Applet.IconApplet {
     }
 
     on_applet_clicked() {
-        this.menu.toggle();
-    }
-
-    _protectFromBlur() {
-        this._processMenus();
-        this._menuTimer = setInterval(() => this._processMenus(), 500);
-        this._stageSignalId = global.stage.connect('notify::focus-key', () => {
-            this._setTimeout(() => this._processMenus(), 50);
-        });
-    }
-
-    _isOurMenu(menu) {
-        try {
-            let parent = menu.actor;
-            while (parent) {
-                if (parent._delegate && parent._delegate._applet === this) {
-                    return true;
-                }
-                parent = parent.get_parent();
-            }
-        } catch (e) {
-            global.logError("Error in _isOurMenu: " + e);
-        }
-        return false;
-    }
-
-    _processMenus() {
-        let self = this;
-        try {
-            let menus = [];
-            let findMenus = (actor) => {
-                if (actor instanceof PopupMenu.PopupMenu) {
-                    menus.push(actor);
-                }
-                let children = actor.get_children();
-                if (children) {
-                    children.forEach(findMenus);
-                }
-            };
-            findMenus(Main.uiGroup);
-
-            menus.forEach(menu => {
-                if (!self._isOurMenu(menu)) {
-                    return;
-                }
-                if (!self._originalAllocate && menu.actor.allocate) {
-                    self._originalAllocate = menu.actor.allocate;
-                    menu.actor.allocate = function(box, flags) {
-                        self._originalAllocate.call(this, box, flags);
-                        if (this instanceof St.ScrollView) {
-                            this.queue_relayout();
-                            let vscroll = this.get_vscroll_bar();
-                            if (vscroll) {
-                                vscroll.queue_relayout();
-                            }
-                        }
-                    };
-                }
-                let fixScrollView = (actor) => {
-                    if (actor instanceof St.ScrollView) {
-                        actor.set_style('overflow-y: auto; max-height: 400px;');
-                        actor.queue_relayout();
-                    }
-                    let children = actor.get_children();
-                    if (children) {
-                        children.forEach(fixScrollView);
-                    }
-                };
-                fixScrollView(menu.actor);
-            });
-        } catch (e) {
-            global.log("Error in _processMenus: " + e);
+        this._assert(!this._destroyed, "Applet destroyed");
+        if (!this._destroyed && this.menu) {
+            this.menu.toggle();
         }
     }
 
     _forceSubmenuStyles(menu) {
         menu.connect('open-state-changed', (subMenu, open) => {
             if (open) {
-                [10, 50, 100, 200].forEach(delay => {
-                    this._setTimeout(() => {
-                        try {
-                            let actor = subMenu.actor;
-                            if (actor instanceof imports.gi.St.ScrollView) {
-                                let [width, height] = actor.get_size();
-                                actor.set_height(-1);
-                                actor.set_width(-1);
-                                actor.queue_relayout();
-                                this._setTimeout(() => {
-                                    actor.set_height(height);
-                                    actor.set_width(width);
-                                    actor.queue_relayout();
-                                    let vscroll = actor.get_vscroll_bar();
-                                    if (vscroll) {
-                                        vscroll.queue_relayout();
-                                    }
-                                }, 5);
-                            }
-                            let parent = actor.get_parent();
-                            while (parent) {
-                                parent.queue_relayout();
-                                parent = parent.get_parent();
-                            }
-                        } catch (e) {
-                            global.log("Error forcing allocation: " + e);
-                        }
-                    }, delay);
-                });
+                this._scheduleSubmenuStyleFix(subMenu);
             }
         });
     }
 
-    _isDaemonRunning() {
-        if (!GLib.file_test(DAEMON_PID_FILE, GLib.FileTest.EXISTS)) {
-            return false;
-        }
-        try {
-            let pid = parseInt(GLib.file_get_contents(DAEMON_PID_FILE)[1].toString().trim(), 10);
-            if (isNaN(pid) || pid <= 0) {
-                return false;
-            }
-            let [success] = GLib.spawn_command_line_sync(`kill -0 ${pid}`);
-            return success;
-        } catch (e) {
-            global.logError("Error checking daemon status: " + e);
-            return false;
+    _scheduleSubmenuStyleFix(subMenu) {
+        const delays = [10, 50, 100, 200];
+        for (let i = 0; i < delays.length; i++) {
+            let delay = delays[i];
+            this._setTimeout(() => this._applySubmenuStyleFix(subMenu), delay);
         }
     }
 
+    _applySubmenuStyleFix(subMenu) {
+        try {
+            let actor = subMenu.actor;
+            if (actor instanceof imports.gi.St.ScrollView) {
+                this._fixScrollViewSize(actor);
+            }
+            this._relayoutActorParents(actor);
+        } catch (e) {
+            global.log("Error forcing allocation: " + e);
+        }
+    }
+
+    _fixScrollViewSize(actor) {
+        let [width, height] = actor.get_size();
+        actor.set_height(-1);
+        actor.set_width(-1);
+        actor.queue_relayout();
+        this._setTimeout(() => this._restoreScrollViewSize(actor, width, height), 5);
+    }
+
+    _restoreScrollViewSize(actor, width, height) {
+        actor.set_height(height);
+        actor.set_width(width);
+        actor.queue_relayout();
+        let vscroll = actor.get_vscroll_bar();
+        if (vscroll) {
+            vscroll.queue_relayout();
+        }
+    }
+
+    _relayoutActorParents(actor) {
+        let depth = 0;
+        const MAX_DEPTH = 100;
+        let parent = actor.get_parent();
+        while (parent && depth < MAX_DEPTH) {
+            parent.queue_relayout();
+            parent = parent.get_parent();
+            depth++;
+        }
+        this._assert(depth < MAX_DEPTH, "Actor tree too deep");
+    }
+
+    _isDaemonRunning(callback) {
+        this._assert(typeof callback === 'function', "callback must be function");
+        this._assert(!this._destroyed, "Applet destroyed");
+
+        let file = Gio.File.new_for_path(DAEMON_PID_FILE);
+        file.load_contents_async(null, (obj, res) => {
+            try {
+                let [ok, contents] = obj.load_contents_finish(res);
+                if (!ok) {
+                    callback(false);
+                    return;
+                }
+                this._handleDaemonPidContents(contents, callback);
+            } catch (e) {
+                void e;
+                callback(false);
+            }
+        });
+    }
+
+    _handleDaemonPidContents(contents, callback) {
+        let pid = parseInt(contents.toString().trim(), 10);
+        if (isNaN(pid) || pid <= 0) {
+            callback(false);
+            return;
+        }
+        this._checkProcessExists(pid, callback);
+    }
+
+    _checkProcessExists(pid, callback) {
+        this._assert(typeof pid === 'number' && pid > 0, "Invalid PID");
+        this._assert(typeof callback === 'function', "callback must be function");
+
+        const procFile = Gio.File.new_for_path('/proc/' + pid);
+        procFile.query_info_async('*', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null,
+            (obj, res) => {
+                try {
+                    obj.query_info_finish(res);
+                    callback(true);
+                } catch (e) {
+                    global.log("UltraspanApplet: daemon process check failed: " + e);
+                    callback(false);
+                }
+            });
+    }
+
     _buildMenu() {
+        this._assert(!this._destroyed, "Applet destroyed");
+        this._assert(this.menu !== null, "Menu not created");
+
         this.menu.removeAll();
 
         this._addFolderSubMenu();
@@ -253,7 +233,9 @@ class UltraspanApplet extends Applet.IconApplet {
 
     _rebuildMenu() {
         this._buildMenu();
-        this.menu.open();
+        if (this.menu) {
+            this.menu.open();
+        }
     }
 
     /* ---------------- Folder submenu ---------------- */
@@ -285,8 +267,9 @@ class UltraspanApplet extends Applet.IconApplet {
 
             const createItem = new PopupMenu.PopupMenuItem(_("Create folder"));
             createItem.connect("activate", () => {
-                GLib.mkdir_with_parents(RANDOM_FOLDER, 0o755);
-                this._setTimeout(() => this._rebuildMenu(), 300);
+                this._ensureFolderExistsAsync(RANDOM_FOLDER, () => {
+                    this._setTimeout(() => this._rebuildMenu(), 300);
+                });
             });
             folderItem.menu.addMenuItem(createItem);
         } else {
@@ -297,7 +280,26 @@ class UltraspanApplet extends Applet.IconApplet {
         }
     }
 
+    _ensureFolderExistsAsync(folderPath, callback) {
+        this._assert(typeof folderPath === 'string', "folderPath must be string");
+        this._assert(typeof callback === 'function', "callback must be function");
+
+        let dir = Gio.File.new_for_path(folderPath);
+        dir.make_directory_with_parents_async(null, (obj, res) => {
+            try {
+                obj.make_directory_with_parents_finish(res);
+                callback();
+            } catch (e) {
+                global.logError("Error creating folder: " + e);
+                callback();
+            }
+        });
+    }
+
     _populateFolderMenu(folderItem, images) {
+        this._assert(folderItem instanceof PopupMenu.PopupSubMenuMenuItem, "Invalid folderItem");
+        this._assert(Array.isArray(images), "Images must be array");
+
         if (images.length === 0) {
             const noImagesItem = new PopupMenu.PopupMenuItem(_("No images found"));
             noImagesItem.setSensitive(false);
@@ -473,6 +475,9 @@ class UltraspanApplet extends Applet.IconApplet {
     }
 
     _validateAndApplyPerMonitor(entries, images, monitorCount) {
+        this._assert(Array.isArray(entries), "Entries must be array");
+        this._assert(Array.isArray(images), "Images must be array");
+
         let chosen = [];
         for (let i = 0; i < entries.length; i++) {
             let num = parseInt(entries[i].text, 10);
@@ -497,6 +502,7 @@ class UltraspanApplet extends Applet.IconApplet {
 
     /* ---------------- Settings submenu ---------------- */
     _addSettingsSubMenu() {
+        this._assert(!this._destroyed, "Applet destroyed");
         this.settingsSubmenu = new PopupMenu.PopupSubMenuMenuItem(_("Settings"));
         this._forceSubmenuStyles(this.settingsSubmenu);
         this.settingsSubmenu.menu.actor.add_style_class_name('ultraspan-submenu');
@@ -509,6 +515,7 @@ class UltraspanApplet extends Applet.IconApplet {
     }
 
     _populateSettingsMenu(config) {
+        this._assert(config !== null, "Config is null");
         const menu = this.settingsSubmenu.menu;
 
         this._buildModeSection(config, menu);
@@ -635,10 +642,18 @@ class UltraspanApplet extends Applet.IconApplet {
             refLabel.text = _("Refresh: ") + labelText;
             this._refreshTooltip.set_text(_("Refresh: ") + labelText);
             this._runCommandInBackground(["set-config", "refresh_interval", mins.toString()]);
+
             const refreshFile = GLib.build_filenamev([CONFIG_DIR, "refresh"]);
-            if (GLib.file_test(refreshFile, GLib.FileTest.EXISTS)) {
-                this._runCommandInBackground(["refresh-start", mins.toString()]);
-            }
+            let refreshGFile = Gio.File.new_for_path(refreshFile);
+            refreshGFile.query_info_async('*', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null,
+                (obj, res) => {
+                    try {
+                        obj.query_info_finish(res);
+                        this._runCommandInBackground(["refresh-start", mins.toString()]);
+                    } catch (e) {
+                        void e;
+                    }
+                });
         });
         menu.addMenuItem(this._refreshIntervalSlider);
     }
@@ -668,6 +683,7 @@ class UltraspanApplet extends Applet.IconApplet {
     }
 
     _createHeader(text) {
+        this._assert(typeof text === 'string', "Header text must be string");
         let header = new PopupMenu.PopupMenuItem(text);
         header.setSensitive(false);
         header.actor.add_style_class_name('ultraspan-header');
@@ -675,6 +691,7 @@ class UltraspanApplet extends Applet.IconApplet {
     }
 
     _updateMutuallyExclusive(switchMap, activeKey) {
+        this._assert(switchMap !== null, "switchMap is null");
         for (let key in switchMap) {
             if (key !== activeKey && switchMap[key]) {
                 switchMap[key].setToggleState(false);
@@ -684,9 +701,10 @@ class UltraspanApplet extends Applet.IconApplet {
 
     /* ---------------- Daemon control ---------------- */
     _addDaemonControl() {
-        const running = this._isDaemonRunning();
-        this._refreshStartStopItem = this._createDaemonMenuItem(running);
-        this.menu.addMenuItem(this._refreshStartStopItem);
+        this._isDaemonRunning((running) => {
+            this._refreshStartStopItem = this._createDaemonMenuItem(running);
+            this.menu.addMenuItem(this._refreshStartStopItem);
+        });
     }
 
     _swapDaemonButton(isRunning) {
@@ -765,9 +783,10 @@ class UltraspanApplet extends Applet.IconApplet {
             obj.query_info_finish(res);
             this._startRandomWithConfig();
         } catch (e) {
-            GLib.mkdir_with_parents(RANDOM_FOLDER, 0o755);
             global.logError("Error checking random folder: " + e);
-            this._startRandomWithConfig();
+            this._ensureFolderExistsAsync(RANDOM_FOLDER, () => {
+                this._startRandomWithConfig();
+            });
         }
     }
 
@@ -782,28 +801,30 @@ class UltraspanApplet extends Applet.IconApplet {
 
     /* ---------------- Async helpers ---------------- */
     _getMonitorInfoAsync(callback) {
-        try {
-            let [ok, stdout] = GLib.spawn_sync(
-                null,
-                ['xrandr', '--listmonitors'],
-                null,
-                GLib.SpawnFlags.SEARCH_PATH,
-                null
-            );
-            if (!ok) {
+        let proc = new Gio.Subprocess({
+            argv: ['xrandr', '--listmonitors'],
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        });
+        proc.init(null);
+        proc.communicate_utf8_async(null, null, (proc, res) => {
+            try {
+                let [, stdout, stderr] = proc.communicate_utf8_finish(res);
+                if (!proc.get_successful()) {
+                    global.logError('xrandr failed: ' + stderr);
+                    callback([]);
+                    return;
+                }
+                let monitors = this._parseMonitorOutput(stdout);
+                callback(monitors);
+            } catch (e) {
+                global.logError('Error reading monitor info: ' + e);
                 callback([]);
-                return;
             }
-            let monitors = this._parseMonitorOutput(stdout);
-            callback(monitors);
-        } catch (e) {
-            global.logError("Error getting monitors: " + e);
-            callback([]);
-        }
+        });
     }
 
     _parseMonitorOutput(stdout) {
-        let lines = stdout.toString().split('\n');
+        let lines = stdout.split('\n');
         let monitors = [];
         for (let i = 1; i < lines.length; i++) {
             let line = lines[i].trim();
@@ -920,7 +941,11 @@ class UltraspanApplet extends Applet.IconApplet {
         }
 
         this._addImageFiles(files, folderPath, images, maxCount);
-        this._enumerateNextAsync(enumerator, folderPath, images, maxCount, callback);
+        // Schedule next batch on idle to avoid recursion
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._enumerateNextAsync(enumerator, folderPath, images, maxCount, callback);
+            return false;
+        });
     }
 
     _runCommandInBackground(args) {
