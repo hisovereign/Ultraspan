@@ -604,6 +604,9 @@ class UltraspanApplet extends Applet.IconApplet {
         this._buildMultiRandomSwitch(config, menu);
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
+        this._buildPerWorkspaceSwitch(config, menu);
+        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
         this._buildClearCacheItem(menu);
     }
 
@@ -762,6 +765,20 @@ class UltraspanApplet extends Applet.IconApplet {
             item.actor.accessible_name = _("Multi‑monitor random") + ", " + (state ? _("on") : _("off"));
         });
         menu.addMenuItem(this._multiRandomSwitch);
+    }
+
+    _buildPerWorkspaceSwitch(config, menu) {
+        this._perWorkspaceSwitch = new PopupMenu.PopupSwitchMenuItem(
+            _("Per‑Workspace Wallpapers"),
+            config.per_workspace
+        );
+        this._perWorkspaceSwitch.actor.accessible_name = _("Per‑Workspace Wallpapers") + ", " + (config.per_workspace ? _("on") : _("off"));
+        this._perWorkspaceSwitch.actor.accessible_description = _("Use different wallpapers for each workspace");
+        this._perWorkspaceSwitch.connect('toggled', (item, state) => {
+            this._runCommandInBackground(["set-config", "per_workspace", state ? "true" : "false"]);
+            item.actor.accessible_name = _("Per‑Workspace Wallpapers") + ", " + (state ? _("on") : _("off"));
+        });
+        menu.addMenuItem(this._perWorkspaceSwitch);
     }
 
     _buildClearCacheItem(menu) {
@@ -952,7 +969,8 @@ class UltraspanApplet extends Applet.IconApplet {
             blur: 15,
             random_interval: 30,
             refresh_interval: 480,
-            multi_random: false
+            multi_random: false,
+            per_workspace: false
         };
         const configPath = GLib.build_filenamev([CONFIG_DIR, "config"]);
         let configFile = Gio.File.new_for_path(configPath);
@@ -989,7 +1007,7 @@ class UltraspanApplet extends Applet.IconApplet {
     _applyConfigValue(key, value, config) {
         if (["blur", "random_interval", "refresh_interval"].includes(key)) {
             config[key] = parseInt(value, 10);
-        } else if (key === "multi_random") {
+        } else if (["multi_random", "per_workspace"].includes(key)) {
             config[key] = (value === "true");
         } else if (value) {
             config[key] = value;
