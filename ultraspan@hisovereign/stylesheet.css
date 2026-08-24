@@ -1,0 +1,41 @@
+/* Submenu sizing – wider to prevent toggle clipping */
+.ultraspan-submenu {
+    min-width: 300px;
+    max-width: 500px;
+}
+
+/* Image filename truncation */
+.ultraspan-filename {
+    max-width: 230px;
+    min-width: 180px;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+/* Header text – fixed contrast: #555 → #333 */
+.ultraspan-header {
+    font-weight: bold;
+    color: #333;
+}
+
+/* Number entry fields in per‑monitor menu */
+.ultraspan-submenu StEntry {
+    background-color: white;
+    color: black;
+    caret-color: black;
+    border: 1px solid #888;
+    border-radius: 4px;
+    padding: 0px 2px;
+    min-width: 36px;
+}
+
+/* Visible focus for keyboard users */
+.ultraspan-submenu :focus {
+    outline: 2px solid @theme_selected_bg_color;
+    outline-offset: -2px;
+}
+
+.ultraspan-submenu StEntry:focus {
+    outline: 2px solid @theme_selected_bg_color;
+}
