@@ -6,6 +6,7 @@ const St = imports.gi.St;
 const Main = imports.ui.main;
 const Gettext = imports.gettext;
 const Tooltips = imports.ui.tooltips;
+const Gtk = imports.gi.Gtk;
 
 let UUID = "ultraspan@hisovereign";
 
@@ -33,11 +34,19 @@ function _(text) {
 class UltraspanApplet extends Applet.IconApplet {
     constructor(metadata, orientation, panelHeight, instanceId) {
         super(orientation, panelHeight, instanceId);
-        this._assert(!this._destroyed, "Applet already destroyed");
         this._destroyed = false;
+        this._assert(!this._destroyed, "Applet already destroyed");
 
-        this.set_applet_icon_symbolic_name("preferences-desktop-wallpaper-symbolic");
+
+        let iconName = "preferences-desktop-wallpaper-symbolic";
+        if (!Gtk.IconTheme.get_default().has_icon(iconName)) {
+            iconName = "image-x-generic-symbolic";
+        }
+        this.set_applet_icon_symbolic_name(iconName);
         this.set_applet_tooltip(_("Ultraspan"));
+        // Accessibility: name the applet icon
+        this.actor.accessible_name = _("Ultraspan wallpaper manager");
+        this.actor.accessible_description = _("Control your multi‑monitor wallpaper settings");
 
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager = new PopupMenu.PopupMenuManager(this);
@@ -118,6 +127,18 @@ class UltraspanApplet extends Applet.IconApplet {
             let delay = delays[i];
             this._setTimeout(() => this._applySubmenuStyleFix(subMenu), delay);
         }
+        // Focus trap: move focus to first interactive child
+        this._setTimeout(() => {
+            let actor = subMenu.actor;
+            let firstChild = actor.get_first_child();
+            while (firstChild) {
+                if (firstChild.can_focus && firstChild.reactive) {
+                    firstChild.grab_key_focus();
+                    break;
+                }
+                firstChild = firstChild.get_next_sibling();
+            }
+        }, 100);
     }
 
     _applySubmenuStyleFix(subMenu) {
@@ -225,6 +246,8 @@ class UltraspanApplet extends Applet.IconApplet {
         this._addRandomControl();
 
         let refreshMenuItem = new PopupMenu.PopupMenuItem("⟳ " + _("Refresh menu"));
+        refreshMenuItem.actor.accessible_name = _("Refresh menu");
+        refreshMenuItem.actor.accessible_description = _("Rebuild the applet menu to reflect latest settings");
         refreshMenuItem.connect('activate', () => {
             this._rebuildMenu();
         });
@@ -241,6 +264,8 @@ class UltraspanApplet extends Applet.IconApplet {
     /* ---------------- Folder submenu ---------------- */
     _addFolderSubMenu() {
         const folderItem = new PopupMenu.PopupSubMenuMenuItem(_("Set wallpaper"));
+        folderItem.actor.accessible_name = _("Set wallpaper from folder");
+        folderItem.actor.accessible_description = _("Choose an image from your wallpaper folder to set as wallpaper");
         this._forceSubmenuStyles(folderItem);
         folderItem.menu.actor.add_style_class_name('ultraspan-submenu');
         this.menu.addMenuItem(folderItem);
@@ -263,9 +288,12 @@ class UltraspanApplet extends Applet.IconApplet {
         if (error.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
             const noFolderItem = new PopupMenu.PopupMenuItem(_("Folder does not exist"));
             noFolderItem.setSensitive(false);
+            noFolderItem.actor.accessible_name = _("Wallpaper folder does not exist");
             folderItem.menu.addMenuItem(noFolderItem);
 
             const createItem = new PopupMenu.PopupMenuItem(_("Create folder"));
+            createItem.actor.accessible_name = _("Create wallpaper folder");
+            createItem.actor.accessible_description = _("Create the default wallpaper folder and open it");
             createItem.connect("activate", () => {
                 this._ensureFolderExistsAsync(RANDOM_FOLDER, () => {
                     this._setTimeout(() => this._rebuildMenu(), 300);
@@ -276,6 +304,7 @@ class UltraspanApplet extends Applet.IconApplet {
             global.logError("Error checking folder: " + error);
             const errorItem = new PopupMenu.PopupMenuItem(_("Folder error"));
             errorItem.setSensitive(false);
+            errorItem.actor.accessible_name = _("Folder error");
             folderItem.menu.addMenuItem(errorItem);
         }
     }
@@ -304,9 +333,12 @@ class UltraspanApplet extends Applet.IconApplet {
             const noImagesItem = new PopupMenu.PopupMenuItem(_("No images found"));
             noImagesItem.setSensitive(false);
             noImagesItem.actor.add_style_class_name('ultraspan-header');
+            noImagesItem.actor.accessible_name = _("No images found");
             folderItem.menu.addMenuItem(noImagesItem);
 
             const openItem = new PopupMenu.PopupMenuItem(_("Open folder to add images"));
+            openItem.actor.accessible_name = _("Open folder");
+            openItem.actor.accessible_description = _("Open the wallpaper folder in your file manager");
             openItem.connect("activate", () => {
                 this._openFolderInFileManager(RANDOM_FOLDER);
             });
@@ -317,11 +349,14 @@ class UltraspanApplet extends Applet.IconApplet {
         const countItem = new PopupMenu.PopupMenuItem(_("%d images found").format(images.length));
         countItem.setSensitive(false);
         countItem.actor.add_style_class_name('ultraspan-header');
+        countItem.actor.accessible_name = _("%d images found").format(images.length);
         folderItem.menu.addMenuItem(countItem);
 
         images.forEach(image => {
             const item = new PopupMenu.PopupMenuItem(this._truncateName(image.name, 25));
             item.actor.add_style_class_name('ultraspan-filename');
+            item.actor.accessible_name = _("Set wallpaper ") + image.name;
+            item.actor.accessible_description = _("Set this image as your wallpaper");
             item.connect("activate", () => {
                 this._setWallpaper(image.path);
             });
@@ -331,6 +366,8 @@ class UltraspanApplet extends Applet.IconApplet {
         folderItem.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         const openFolderItem = new PopupMenu.PopupMenuItem(_("Open folder"));
+        openFolderItem.actor.accessible_name = _("Open wallpaper folder");
+        openFolderItem.actor.accessible_description = _("Open the wallpaper folder in your file manager");
         openFolderItem.connect("activate", () => {
             this._openFolderInFileManager(RANDOM_FOLDER);
         });
@@ -340,6 +377,8 @@ class UltraspanApplet extends Applet.IconApplet {
     /* ---------------- Per-monitor submenu ---------------- */
     _addPerMonitorSubMenu() {
         const perMonitorItem = new PopupMenu.PopupSubMenuMenuItem(_("Set per‑monitor"));
+        perMonitorItem.actor.accessible_name = _("Set per‑monitor wallpaper");
+        perMonitorItem.actor.accessible_description = _("Assign different wallpapers to each monitor");
         this._forceSubmenuStyles(perMonitorItem);
         perMonitorItem.menu.actor.add_style_class_name('ultraspan-submenu');
         this.menu.addMenuItem(perMonitorItem);
@@ -356,6 +395,7 @@ class UltraspanApplet extends Applet.IconApplet {
     _showPerMonitorNoMonitors(perMonitorItem) {
         let err = new PopupMenu.PopupMenuItem(_("Could not detect monitors"));
         err.setSensitive(false);
+        err.actor.accessible_name = _("Could not detect monitors");
         perMonitorItem.menu.addMenuItem(err);
     }
 
@@ -389,12 +429,14 @@ class UltraspanApplet extends Applet.IconApplet {
     _showPerMonitorFolderMissing(perMonitorItem) {
         let item = new PopupMenu.PopupMenuItem(_("Folder does not exist"));
         item.setSensitive(false);
+        item.actor.accessible_name = _("Wallpaper folder does not exist");
         perMonitorItem.menu.addMenuItem(item);
     }
 
     _showPerMonitorFolderError(perMonitorItem) {
         let item = new PopupMenu.PopupMenuItem(_("Folder error"));
         item.setSensitive(false);
+        item.actor.accessible_name = _("Folder error");
         perMonitorItem.menu.addMenuItem(item);
     }
 
@@ -410,6 +452,7 @@ class UltraspanApplet extends Applet.IconApplet {
     _showPerMonitorNoImages(perMonitorItem) {
         let noImg = new PopupMenu.PopupMenuItem(_("No images found"));
         noImg.setSensitive(false);
+        noImg.actor.accessible_name = _("No images found");
         perMonitorItem.menu.addMenuItem(noImg);
     }
 
@@ -417,7 +460,7 @@ class UltraspanApplet extends Applet.IconApplet {
         this._addPerMonitorImageList(perMonitorItem, images);
         perMonitorItem.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        let entries = this._createMonitorEntries(perMonitorItem, monitors);
+        let entries = this._createMonitorEntries(perMonitorItem, monitors, images.length);
         perMonitorItem.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         this._addPerMonitorApplyButton(perMonitorItem, entries, images, monitors.length);
@@ -427,22 +470,26 @@ class UltraspanApplet extends Applet.IconApplet {
         let listHeader = new PopupMenu.PopupMenuItem(_("Images (use numbers below)"));
         listHeader.setSensitive(false);
         listHeader.actor.add_style_class_name('ultraspan-header');
+        listHeader.actor.accessible_name = _("Images list");
+        listHeader.actor.accessible_description = _("Enter the number of the image you want for each monitor");
         perMonitorItem.menu.addMenuItem(listHeader);
 
         for (let i = 0; i < images.length; i++) {
             let label = (i + 1) + ". " + this._truncateName(images[i].name, 25);
             let item = new PopupMenu.PopupMenuItem(label);
             item.setSensitive(false);
+            item.actor.accessible_name = images[i].name;
             perMonitorItem.menu.addMenuItem(item);
         }
     }
 
-    _createMonitorEntries(perMonitorItem, monitors) {
+    _createMonitorEntries(perMonitorItem, monitors, imageCount) {
         let entries = [];
         for (let i = 0; i < monitors.length; i++) {
             let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
             let box = new St.BoxLayout({ vertical: false });
             let lbl = new St.Label({ text: _("Monitor %d (%s): ").format(i + 1, monitors[i]) });
+            lbl.accessible_name = _("Monitor %d (%s): ").format(i + 1, monitors[i]);
             box.add(lbl);
 
             let entry = new St.Entry({
@@ -451,8 +498,25 @@ class UltraspanApplet extends Applet.IconApplet {
                 can_focus: true,
                 reactive: true
             });
+            // Accessibility: describe the entry with the label
+            entry.accessible_name = _("Image number for monitor %d").format(i + 1);
+            entry.accessible_description = _("Enter a number from 1 to %d").format(imageCount);
+            // Associate label with entry (St doesn't have direct accessible_relationship, but we set name and description)
             entry.clutter_text.set_single_line_mode(true);
             entry.clutter_text.set_width(30);
+
+            // Direct styling: removes extra left padding and makes the white box fit the text
+            entry.set_style(
+                'background-color: white;' +
+                'color: black;' +
+                'caret-color: black;' +
+                'border: 1px solid #888;' +
+                'border-radius: 4px;' +
+                'padding: 0 2px;' +
+                'min-width: 30px;' +
+                'max-width: 36px;'
+            );
+
             box.add(entry);
             item.addActor(box);
             perMonitorItem.menu.addMenuItem(item);
@@ -463,6 +527,8 @@ class UltraspanApplet extends Applet.IconApplet {
 
     _addPerMonitorApplyButton(perMonitorItem, entries, images, monitorCount) {
         let applyButton = new PopupMenu.PopupMenuItem(_("Apply per‑monitor"));
+        applyButton.actor.accessible_name = _("Apply per-monitor wallpaper");
+        applyButton.actor.accessible_description = _("Sets different wallpapers for each monitor based on the image numbers you entered");
         applyButton.connect('activate', () => {
             this._validateAndApplyPerMonitor(entries, images, monitorCount);
             this.menu.close();
@@ -504,6 +570,8 @@ class UltraspanApplet extends Applet.IconApplet {
     _addSettingsSubMenu() {
         this._assert(!this._destroyed, "Applet destroyed");
         this.settingsSubmenu = new PopupMenu.PopupSubMenuMenuItem(_("Settings"));
+        this.settingsSubmenu.actor.accessible_name = _("Settings");
+        this.settingsSubmenu.actor.accessible_description = _("Configure wallpaper mode, background, blur, intervals, and more");
         this._forceSubmenuStyles(this.settingsSubmenu);
         this.settingsSubmenu.menu.actor.add_style_class_name('ultraspan-submenu');
         this.menu.addMenuItem(this.settingsSubmenu);
@@ -549,12 +617,20 @@ class UltraspanApplet extends Applet.IconApplet {
                 _(mode.charAt(0).toUpperCase() + mode.slice(1)),
                 config.mode === mode
             );
+            switchItem.actor.accessible_name = _(mode.charAt(0).toUpperCase() + mode.slice(1)) + ", " + (config.mode === mode ? _("selected") : _("not selected"));
+            switchItem.actor.accessible_description = _("Set wallpaper mode to %s").format(mode);
             switchItem.connect('toggled', (item, state) => {
                 if (!state) {
                     return;
                 }
                 this._runCommandInBackground(["mode", mode]);
                 this._updateMutuallyExclusive(this._modeSwitches, mode);
+                // Update accessible name for all switches in group
+                for (let key in this._modeSwitches) {
+                    let sw = this._modeSwitches[key];
+                    let isActive = (key === mode);
+                    sw.actor.accessible_name = _(key.charAt(0).toUpperCase() + key.slice(1)) + ", " + (isActive ? _("selected") : _("not selected"));
+                }
             });
             this._modeSwitches[mode] = switchItem;
             menu.addMenuItem(switchItem);
@@ -571,12 +647,19 @@ class UltraspanApplet extends Applet.IconApplet {
                 _(type.charAt(0).toUpperCase() + type.slice(1)),
                 config.bg_type === type
             );
+            switchItem.actor.accessible_name = _(type.charAt(0).toUpperCase() + type.slice(1)) + ", " + (config.bg_type === type ? _("selected") : _("not selected"));
+            switchItem.actor.accessible_description = _("Set background type to %s").format(type);
             switchItem.connect('toggled', (item, state) => {
                 if (!state) {
                     return;
                 }
                 this._runCommandInBackground(["bg-type", type]);
                 this._updateMutuallyExclusive(this._bgTypeSwitches, type);
+                for (let key in this._bgTypeSwitches) {
+                    let sw = this._bgTypeSwitches[key];
+                    let isActive = (key === type);
+                    sw.actor.accessible_name = _(key.charAt(0).toUpperCase() + key.slice(1)) + ", " + (isActive ? _("selected") : _("not selected"));
+                }
             });
             this._bgTypeSwitches[type] = switchItem;
             menu.addMenuItem(switchItem);
@@ -590,11 +673,14 @@ class UltraspanApplet extends Applet.IconApplet {
         let blurLabel = this._blurSlider.actor.get_children()[0];
         blurLabel.text = _("Blur: ") + config.blur;
         this._blurTooltip = new Tooltips.Tooltip(this._blurSlider.actor, _("Blur: ") + config.blur);
+        this._blurSlider.actor.accessible_name = _("Blur amount: ") + config.blur;
+        this._blurSlider.actor.accessible_description = _("Adjust the strength of the blur effect");
 
         this._blurSlider.connect('value-changed', (item) => {
             let val = Math.round(item._value * 100);
             blurLabel.text = _("Blur: ") + val;
             this._blurTooltip.set_text(_("Blur: ") + val);
+            this._blurSlider.actor.accessible_name = _("Blur amount: ") + val;
             this._runCommandInBackground(["blur", val.toString()]);
         });
         menu.addMenuItem(this._blurSlider);
@@ -608,11 +694,14 @@ class UltraspanApplet extends Applet.IconApplet {
         let randLabel = this._randomIntervalSlider.actor.get_children()[0];
         randLabel.text = _("Random: ") + randVal + " min";
         this._randomTooltip = new Tooltips.Tooltip(this._randomIntervalSlider.actor, _("Random: ") + randVal + " min");
+        this._randomIntervalSlider.actor.accessible_name = _("Random interval: ") + randVal + " min";
+        this._randomIntervalSlider.actor.accessible_description = _("Time between wallpaper changes in minutes");
 
         this._randomIntervalSlider.connect('value-changed', (item) => {
             let minutes = Math.max(1, Math.round(item._value * 119 + 1));
             randLabel.text = _("Random: ") + minutes + " min";
             this._randomTooltip.set_text(_("Random: ") + minutes + " min");
+            this._randomIntervalSlider.actor.accessible_name = _("Random interval: ") + minutes + " min";
             this._runCommandInBackground(["interval", minutes.toString()]);
         });
         menu.addMenuItem(this._randomIntervalSlider);
@@ -631,6 +720,8 @@ class UltraspanApplet extends Applet.IconApplet {
         }
         refLabel.text = _("Refresh: ") + labelText;
         this._refreshTooltip = new Tooltips.Tooltip(this._refreshIntervalSlider.actor, _("Refresh: ") + labelText);
+        this._refreshIntervalSlider.actor.accessible_name = _("Refresh interval: ") + labelText;
+        this._refreshIntervalSlider.actor.accessible_description = _("How often to re‑apply the wallpaper to fix blur");
 
         this._refreshIntervalSlider.connect('value-changed', (item) => {
             let mins = Math.max(60, Math.round(item._value * 1380 + 60));
@@ -641,6 +732,7 @@ class UltraspanApplet extends Applet.IconApplet {
             }
             refLabel.text = _("Refresh: ") + labelText;
             this._refreshTooltip.set_text(_("Refresh: ") + labelText);
+            this._refreshIntervalSlider.actor.accessible_name = _("Refresh interval: ") + labelText;
             this._runCommandInBackground(["set-config", "refresh_interval", mins.toString()]);
 
             const refreshFile = GLib.build_filenamev([CONFIG_DIR, "refresh"]);
@@ -663,14 +755,19 @@ class UltraspanApplet extends Applet.IconApplet {
             _("Multi‑monitor random"),
             config.multi_random
         );
+        this._multiRandomSwitch.actor.accessible_name = _("Multi‑monitor random") + ", " + (config.multi_random ? _("on") : _("off"));
+        this._multiRandomSwitch.actor.accessible_description = _("When on, each monitor gets a different random image");
         this._multiRandomSwitch.connect('toggled', (item, state) => {
             this._runCommandInBackground(["set-config", "multi_random", state ? "true" : "false"]);
+            item.actor.accessible_name = _("Multi‑monitor random") + ", " + (state ? _("on") : _("off"));
         });
         menu.addMenuItem(this._multiRandomSwitch);
     }
 
     _buildClearCacheItem(menu) {
         let clearCacheItem = new PopupMenu.PopupMenuItem(_("Clear cache"));
+        clearCacheItem.actor.accessible_name = _("Clear cache");
+        clearCacheItem.actor.accessible_description = _("Remove all cached wallpaper files and thumbnails");
         clearCacheItem.connect('activate', () => {
             this._runCommandInBackground(["clean"]);
             this._setTimeout(() => {
@@ -687,6 +784,7 @@ class UltraspanApplet extends Applet.IconApplet {
         let header = new PopupMenu.PopupMenuItem(text);
         header.setSensitive(false);
         header.actor.add_style_class_name('ultraspan-header');
+        header.actor.accessible_name = text;
         return header;
     }
 
@@ -721,6 +819,10 @@ class UltraspanApplet extends Applet.IconApplet {
     _createDaemonMenuItem(running) {
         const label = running ? _("Stop Auto Services") : _("Start Auto Services");
         const item = new PopupMenu.PopupMenuItem(label);
+        item.actor.accessible_name = label;
+        item.actor.accessible_description = running ?
+            _("Stop background services like refresh and random rotation") :
+            _("Start background services like refresh and random rotation");
         item.connect('activate', () => {
             const command = running ? ["daemon-stop"] : ["daemon"];
             this._runCommandInBackground(command);
@@ -755,6 +857,8 @@ class UltraspanApplet extends Applet.IconApplet {
 
     _showRandomStopItem() {
         const stopItem = new PopupMenu.PopupMenuItem(_("Stop Random Rotation"));
+        stopItem.actor.accessible_name = _("Stop Random Rotation");
+        stopItem.actor.accessible_description = _("Stops the automatic random wallpaper changer");
         stopItem.connect("activate", () => {
             this._runCommandInBackground(["random-stop"]);
             this._setTimeout(() => this._rebuildMenu(), 100);
@@ -764,6 +868,8 @@ class UltraspanApplet extends Applet.IconApplet {
 
     _handleRandomFileMissing() {
         const startItem = new PopupMenu.PopupMenuItem(_("Start Random Rotation"));
+        startItem.actor.accessible_name = _("Start Random Rotation");
+        startItem.actor.accessible_description = _("Starts automatic random wallpaper changes from your wallpaper folder");
         startItem.connect("activate", () => {
             this._startRandomRotation();
         });
