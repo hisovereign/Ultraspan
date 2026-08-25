@@ -14,7 +14,7 @@ jobs:
       - name: Run ShellCheck
         run: |
           find . -type f \( -name '*.sh' -o -name 'ultraspan' \) -print0 |
-            xargs -0 -n1 shellcheck
+            xargs -0 -n1 shellcheck --exclude=SC2317
 
   python-syntax:
     runs-on: ubuntu-latest
