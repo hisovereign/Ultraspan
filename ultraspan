@@ -1259,9 +1259,13 @@ main() {
         status)
             echo "=== Ultraspan Status ==="
             echo "Version: $VERSION"
-            local current_uri
-            current_uri="$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null | sed "s/'//g")"
-            echo "Current wallpaper: $current_uri"
+            if [[ "${CONFIG[backend]}" == "gsettings" ]]; then
+                local current_uri
+                current_uri="$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null | sed "s/'//g")"
+                echo "Current wallpaper: $current_uri"
+            else
+                echo "Current wallpaper: (not using gsettings backend)"
+            fi
             get_total_span
             echo "Span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
             echo "Mode: ${CONFIG[mode]}, Background: ${CONFIG[bg_type]}"
