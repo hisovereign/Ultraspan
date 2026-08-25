@@ -430,6 +430,7 @@ _process_monitor_images_parallel() {
     local i
 
     # Trap to clean up temporary files on exit (normal or error)
+    # shellcheck disable=SC2317  # trap callback appears unreachable to ShellCheck
     cleanup_temp() {
         for f in "${outfiles[@]}"; do
             [[ -f "$f" ]] && rm -f "$f"
