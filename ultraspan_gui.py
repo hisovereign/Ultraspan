@@ -175,10 +175,12 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.monitor_count = 0
         self.selected_slots = []
         self._selection_update_lock = False
+        self._updating_widgets = False
 
         self._setup_styles()
         self._build_pages()
         self._monitor_config()
+        self._monitor_daemon()
         self.connect('notify::visible-page', self._on_visible_page_changed)
         self._update_service_status()
         assert hasattr(self, 'wallpaper_flowbox'), "Wallpaper flowbox not created"
@@ -478,7 +480,10 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         color_row.set_subtitle("Color used when background type is solid")
         rgba = gtk['Gdk'].RGBA()
         color_str = self.config.get('color')
-        rgba.parse(color_str if color_str else '#000000')
+        try:
+            rgba.parse(color_str if color_str else '#000000')
+        except Exception:
+            rgba.parse('#000000')
         color_dialog = gtk['Gtk'].ColorDialog.new()
         color_dialog.set_title("Choose Solid Color")
         color_btn = gtk['Gtk'].ColorDialogButton.new(color_dialog)
@@ -838,13 +843,14 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         btn.set_active(True)
         max_allowed = self._get_current_max_allowed()
         self.selected_slots = [None] * max_allowed
-        child = self.wallpaper_flowbox.get_first_child()
-        while child is not None:
+        next_child = self.wallpaper_flowbox.get_first_child()
+        while next_child:
+            child = next_child
+            next_child = child.get_next_sibling()
             child.remove_css_class('selected')
             if hasattr(child, 'badge_label'):
                 child.badge_label.set_visible(False)
                 child.badge_label.set_text("")
-            child = child.get_next_sibling()
         for b in (self.mode_single_btn, self.mode_per_monitor_btn, self.mode_per_workspace_btn):
             if b.get_active():
                 b.add_css_class("suggested-action")
@@ -867,7 +873,12 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         cmd = []
         if self.mode_single_btn.get_active():
             if len(paths) >= 1:
-                cmd = ["set", paths[0], mode]
+                # Check if per‑workspace is enabled
+                if self.workspace_row.get_active():
+                    ws = int(self.workspace_spin.get_value())
+                    cmd = ["set", "--workspace", str(ws), paths[0], mode]
+                else:
+                    cmd = ["set", paths[0], mode]
         elif self.mode_per_monitor_btn.get_active():
             if len(paths) >= 1:
                 cmd = ["set-per-monitor"] + paths + [mode]
@@ -921,59 +932,74 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
     def _update_all_widgets(self, *args: object) -> None:
         gtk = GTK
         assert isinstance(self.config, UltraspanConfig), "Config invalid"
-        self.config.load()
-        assert hasattr(self, 'backend_row'), "backend_row not created"
-        self.backend_row.set_selected(self._get_index(self.backend_row.get_model(), self.config.get('backend')))
-        self.fullscreen_row.set_active(self.config.get_bool('fullscreen_pause'))
-        self.workspace_row.set_active(self.config.get_bool('per_workspace'))
-        self.mode_row.set_selected(self._get_index(self.mode_row.get_model(), self.config.get('mode')))
-        self.bg_type_row.set_selected(self._get_index(self.bg_type_row.get_model(), self.config.get('bg_type')))
-        self.blur_scale.set_value(self.config.get_int('blur'))
-        rgba = gtk['Gdk'].RGBA()
-        color_str = self.config.get('color')
-        rgba.parse(color_str if color_str else '#000000')
-        self.color_btn.props.rgba = rgba
-        self.folder_button.set_label(self.config.get('wallpaper_folder'))
-        self._populate_wallpaper_list_async()
-        self.random_spin.set_value(self.config.get_int('random_interval'))
-        self.multi_random_row.set_active(self.config.get_bool('multi_random'))
-        self.refresh_spin.set_value(self.config.get_int('refresh_interval'))
-        self._update_service_status()
+        self._updating_widgets = True
+        try:
+            self.config.load()
+            assert hasattr(self, 'backend_row'), "backend_row not created"
+            self.backend_row.set_selected(self._get_index(self.backend_row.get_model(), self.config.get('backend')))
+            new_fullscreen = self.config.get_bool('fullscreen_pause')
+            if self.fullscreen_row.get_active() != new_fullscreen:
+                self.fullscreen_row.set_active(new_fullscreen)
+
+            new_workspace = self.config.get_bool('per_workspace')
+            if self.workspace_row.get_active() != new_workspace:
+                self.workspace_row.set_active(new_workspace)
+            self.mode_row.set_selected(self._get_index(self.mode_row.get_model(), self.config.get('mode')))
+            self.bg_type_row.set_selected(self._get_index(self.bg_type_row.get_model(), self.config.get('bg_type')))
+            self.blur_scale.set_value(self.config.get_int('blur'))
+            rgba = gtk['Gdk'].RGBA()
+            color_str = self.config.get('color')
+            rgba.parse(color_str if color_str else '#000000')
+            self.color_btn.props.rgba = rgba
+            self.folder_button.set_label(self.config.get('wallpaper_folder'))
+            self._populate_wallpaper_list_async()
+            self.random_spin.set_value(self.config.get_int('random_interval'))
+            new_multi_random = self.config.get_bool('multi_random')
+            if self.multi_random_row.get_active() != new_multi_random:
+                self.multi_random_row.set_active(new_multi_random)
+            self.refresh_spin.set_value(self.config.get_int('refresh_interval'))
+            self._update_service_status()
+        finally:
+            self._updating_widgets = False
 
     # ------------------------------------------------------------------
     # Signal handlers (unchanged except assertions)
     # ------------------------------------------------------------------
     def _on_backend_changed(self, row: object, *args: object) -> None:
         assert row is not None, "Row cannot be None"
-        assert isinstance(row, Gtk.ComboRow), "Invalid row type"
+        assert isinstance(row, Adw.ComboRow), "Invalid row type"
         val = row.get_model().get_string(row.get_selected())
         self.config.set('backend', val)
         self._run_ultraspan_async(["set-config", "backend", val])
 
     def _on_fullscreen_toggled(self, row: object, *args: object) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
         assert row is not None, "Row cannot be None"
-        assert isinstance(row, Gtk.SwitchRow), "Invalid row type"
+        assert isinstance(row, Adw.SwitchRow), "Invalid row type"
         val = row.get_active()
         self.config.set('fullscreen_pause', str(val).lower())
         self._run_ultraspan_async(["set-config", "fullscreen_pause", str(val).lower()])
 
     def _on_workspace_toggled(self, row: object, *args: object) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
         assert row is not None, "Row cannot be None"
-        assert isinstance(row, Gtk.SwitchRow), "Invalid row type"
+        assert isinstance(row, Adw.SwitchRow), "Invalid row type"
         val = row.get_active()
         self.config.set('per_workspace', str(val).lower())
         self._run_ultraspan_async(["set-config", "per_workspace", str(val).lower()])
 
     def _on_mode_changed(self, row: object, *args: object) -> None:
         assert row is not None, "Row cannot be None"
-        assert isinstance(row, Gtk.ComboRow), "Invalid row type"
+        assert isinstance(row, Adw.ComboRow), "Invalid row type"
         val = row.get_model().get_string(row.get_selected())
         self.config.set('mode', val)
         self._run_ultraspan_async(["mode", val])
 
     def _on_bg_type_changed(self, row: object, *args: object) -> None:
         assert row is not None, "Row cannot be None"
-        assert isinstance(row, Gtk.ComboRow), "Invalid row type"
+        assert isinstance(row, Adw.ComboRow), "Invalid row type"
         val = row.get_model().get_string(row.get_selected())
         self.config.set('bg_type', val)
         self._run_ultraspan_async(["bg-type", val])
@@ -1035,8 +1061,10 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self._run_ultraspan_async(["interval", str(val)])
 
     def _on_multi_random_toggled(self, row: object, *args: object) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
         assert row is not None, "Row cannot be None"
-        assert isinstance(row, Gtk.SwitchRow), "Invalid row type"
+        assert isinstance(row, Adw.SwitchRow), "Invalid row type"
         val = row.get_active()
         self.config.set('multi_random', str(val).lower())
         self._run_ultraspan_async(["set-config", "multi_random", str(val).lower()])
@@ -1050,7 +1078,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
 
     def _on_random_daemon_toggled(self, switch: object, *args: object) -> None:
         assert switch is not None, "Switch cannot be None"
-        assert isinstance(switch, Gtk.SwitchRow), "Invalid switch type"
+        assert isinstance(switch, Adw.SwitchRow), "Invalid switch type"
         active = switch.get_active()
         gtk = GTK
         if active:
@@ -1071,8 +1099,10 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             self.daemon_switch.set_active(daemon_running)
 
     def _on_daemon_toggled(self, row: object, *args: object) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
         assert row is not None, "Row cannot be None"
-        assert isinstance(row, Gtk.SwitchRow), "Invalid row type"
+        assert isinstance(row, Adw.SwitchRow), "Invalid row type"
         val = row.get_active()
         gtk = GTK
         if val:
@@ -1095,6 +1125,23 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             self.monitor = file.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
             self.monitor.connect('changed', callback)
             assert self.monitor is not None, "File monitor not created"
+
+    def _monitor_daemon(self) -> None:
+        """Watch daemon PID file to keep daemon switch in sync."""
+        gtk = GTK
+        if os.path.exists(DAEMON_PID_FILE):
+            file = gtk['Gio'].File.new_for_path(DAEMON_PID_FILE)
+            self.daemon_monitor = file.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
+            self.daemon_monitor.connect('changed', lambda *args: 
+                gtk['GLib'].idle_add(self._update_service_status))
+        else:
+            # If file doesn't exist yet, watch the directory
+            dir_path = os.path.dirname(DAEMON_PID_FILE)
+            if os.path.exists(dir_path):
+                dir_file = gtk['Gio'].File.new_for_path(dir_path)
+                self.daemon_monitor = dir_file.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
+                self.daemon_monitor.connect('changed', lambda *args: 
+                    gtk['GLib'].idle_add(self._update_service_status))
 
     # ------------------------------------------------------------------
     # About dialog
@@ -1122,6 +1169,7 @@ class UltraspanApp:
         assert self.app is not None, "Application creation failed"
         self.app.connect('activate', self.do_activate)
         self.window = None
+        self._updating_widgets = False
 
     def do_activate(self, app: object) -> None:
         assert app is not None, "App cannot be None"
