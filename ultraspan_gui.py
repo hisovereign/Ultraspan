@@ -480,9 +480,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         color_row.set_subtitle("Color used when background type is solid")
         rgba = gtk['Gdk'].RGBA()
         color_str = self.config.get('color')
-        try:
-            rgba.parse(color_str if color_str else '#000000')
-        except Exception:
+        if not rgba.parse(color_str if color_str else '#000000'):
             rgba.parse('#000000')
         color_dialog = gtk['Gtk'].ColorDialog.new()
         color_dialog.set_title("Choose Solid Color")
