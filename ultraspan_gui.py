@@ -852,12 +852,10 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         mode = self.config.get('mode')
         cmd = []
 
-        if self.mode_single_btn.get_active():
-            if len(paths) >= 1:
-                cmd = ["set", paths[0], mode]
-        elif self.mode_per_monitor_btn.get_active():
-            if len(paths) >= 1:
-                cmd = ["set-per-monitor"] + paths + [mode]
+        if self.mode_single_btn.get_active() and len(paths) >= 1:
+            cmd = ["set", paths[0], mode]
+        elif self.mode_per_monitor_btn.get_active() and len(paths) >= 1:
+            cmd = ["set-per-monitor"] + paths + [mode]
 
         if cmd:
             self._run_ultraspan_async(cmd)
