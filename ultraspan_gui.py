@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.1.8
+# Version 1.1.9
 # ============================================
 
 from __future__ import annotations
@@ -280,7 +280,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self._build_folder_group(gtk, wallpapers_page)
         self._build_images_group(gtk, wallpapers_page)
         self._build_monitor_group(gtk, wallpapers_page)
-        self._build_workspace_row(gtk)
 
     def _build_folder_group(self, gtk: dict[str, object], page: object) -> None:
         assert isinstance(gtk, dict), "gtk must be dict"
@@ -334,12 +333,8 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.mode_per_monitor_btn = gtk['Gtk'].ToggleButton.new_with_label("Per‑Monitor")
         self.mode_per_monitor_btn.connect('toggled', self._on_mode_toggled)
 
-        self.mode_per_workspace_btn = gtk['Gtk'].ToggleButton.new_with_label("Per‑Workspace")
-        self.mode_per_workspace_btn.connect('toggled', self._on_mode_toggled)
-
         mode_box.append(self.mode_single_btn)
         mode_box.append(self.mode_per_monitor_btn)
-        mode_box.append(self.mode_per_workspace_btn)
 
         try:
             list_group.set_header_suffix(mode_box)
@@ -388,20 +383,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self._populate_monitor_list()
         assert self.monitor_list_box is not None, "Monitor list box not created"
         assert self.apply_btn is not None, "Apply button not created"
-
-    def _build_workspace_row(self, gtk: dict[str, object]) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        self.workspace_select_row = gtk['Adw'].ActionRow.new()
-        self.workspace_select_row.set_title("Workspace Number (0‑based)")
-        workspace_spin = gtk['Gtk'].SpinButton.new_with_range(0, 20, 1)
-        workspace_spin.set_value(0)
-        self.workspace_select_row.add_suffix(workspace_spin)
-        self.workspace_select_row.set_activatable_widget(workspace_spin)
-        self.workspace_spin = workspace_spin
-        self.workspace_select_row.set_visible(False)
-        self.list_group.add(self.workspace_select_row)
-        assert self.workspace_select_row is not None, "Workspace row not created"
-        assert self.workspace_spin is not None, "Workspace spin not created"
 
     def _build_general_page(self, gtk: dict[str, object]) -> None:
         assert isinstance(gtk, dict), "gtk must be dict"
@@ -837,7 +818,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self._updating_modes = True
         self.mode_single_btn.set_active(False)
         self.mode_per_monitor_btn.set_active(False)
-        self.mode_per_workspace_btn.set_active(False)
         btn.set_active(True)
         max_allowed = self._get_current_max_allowed()
         self.selected_slots = [None] * max_allowed
@@ -849,45 +829,36 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             if hasattr(child, 'badge_label'):
                 child.badge_label.set_visible(False)
                 child.badge_label.set_text("")
-        for b in (self.mode_single_btn, self.mode_per_monitor_btn, self.mode_per_workspace_btn):
+        for b in (self.mode_single_btn, self.mode_per_monitor_btn):
             if b.get_active():
                 b.add_css_class("suggested-action")
             else:
                 b.remove_css_class("suggested-action")
-        self.workspace_select_row.set_visible(self.mode_per_workspace_btn.get_active())
         self.wallpaper_flowbox.set_selection_mode(gtk['Gtk'].SelectionMode.NONE)
         self._updating_modes = False
 
     def _on_apply_clicked(self, btn: object) -> None:
         assert btn is not None, "Button cannot be None"
         assert isinstance(btn, Gtk.Button), "Invalid button type"
+
         selected_children = [child for child in self.selected_slots if child is not None]
         if not selected_children:
             return
+
         paths = [getattr(child, 'path', None) for child in selected_children if getattr(child, 'path', None)]
         if not paths:
             return
+
         mode = self.config.get('mode')
         cmd = []
+
         if self.mode_single_btn.get_active():
             if len(paths) >= 1:
-                # Check if per‑workspace is enabled
-                if self.workspace_row.get_active():
-                    ws = int(self.workspace_spin.get_value())
-                    cmd = ["set", "--workspace", str(ws), paths[0], mode]
-                else:
-                    cmd = ["set", paths[0], mode]
+                cmd = ["set", paths[0], mode]
         elif self.mode_per_monitor_btn.get_active():
             if len(paths) >= 1:
                 cmd = ["set-per-monitor"] + paths + [mode]
-        elif self.mode_per_workspace_btn.get_active():
-            start_ws = int(self.workspace_spin.get_value())
-            if len(paths) == 1:
-                cmd = ["set", "--workspace", str(start_ws), paths[0], mode]
-            elif len(paths) > 1:
-                cmd = ["set-per-monitor", "--workspace", str(start_ws)] + paths + [mode]
-            else:
-                return
+
         if cmd:
             self._run_ultraspan_async(cmd)
             btn.set_label("Applied!")
