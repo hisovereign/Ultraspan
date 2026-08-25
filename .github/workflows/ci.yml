@@ -14,7 +14,7 @@ jobs:
       - name: Run ShellCheck
         run: |
           find . -type f \( -name '*.sh' -o -name 'ultraspan' \) -print0 |
-            xargs -0 -n1 shellcheck --exclude=SC2317
+            xargs -0 -n1 shellcheck
 
   python-syntax:
     runs-on: ubuntu-latest
@@ -28,7 +28,7 @@ jobs:
 
       - name: Check Python syntax
         run: |
-          python3 -m py_compile ultraspan_gui.py
+          python3 -m py_compile ultraspan-gui
 
   ruff:
     runs-on: ubuntu-latest
@@ -39,7 +39,7 @@ jobs:
         run: pip install ruff
 
       - name: Run Ruff
-        run: ruff check ultraspan_gui.py --ignore E501,EXE001
+        run: ruff check ultraspan-gui --ignore E501,EXE001
 
   eslint:
     runs-on: ubuntu-latest
