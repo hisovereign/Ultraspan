@@ -296,7 +296,10 @@ class UltraspanApplet extends Applet.IconApplet {
             createItem.actor.accessible_description = _("Create the default wallpaper folder and open it");
             createItem.connect("activate", () => {
                 this._ensureFolderExistsAsync(RANDOM_FOLDER, () => {
-                    this._setTimeout(() => this._rebuildMenu(), 300);
+                    this._rebuildMenu();
+                    if (this.menu) {
+                        this.menu.open();
+                    }
                 });
             });
             folderItem.menu.addMenuItem(createItem);
@@ -313,16 +316,13 @@ class UltraspanApplet extends Applet.IconApplet {
         this._assert(typeof folderPath === 'string', "folderPath must be string");
         this._assert(typeof callback === 'function', "callback must be function");
 
-        let dir = Gio.File.new_for_path(folderPath);
-        dir.make_directory_with_parents_async(null, (obj, res) => {
-            try {
-                obj.make_directory_with_parents_finish(res);
-                callback();
-            } catch (e) {
-                global.logError("Error creating folder: " + e);
-                callback();
-            }
-        });
+        try {
+            GLib.mkdir_with_parents(folderPath, 0o755);
+            callback();
+        } catch (e) {
+            global.logError("Error creating folder: " + e);
+            callback();
+        }
     }
 
     _populateFolderMenu(folderItem, images) {
@@ -972,8 +972,10 @@ class UltraspanApplet extends Applet.IconApplet {
             multi_random: false,
             per_workspace: false
         };
+
         const configPath = GLib.build_filenamev([CONFIG_DIR, "config"]);
         let configFile = Gio.File.new_for_path(configPath);
+
         configFile.load_contents_async(null, (obj, res) => {
             try {
                 let [success, contents] = obj.load_contents_finish(res);
@@ -981,7 +983,10 @@ class UltraspanApplet extends Applet.IconApplet {
                     this._parseConfigContents(contents, config);
                 }
             } catch (e) {
-                global.logError("Error reading config: " + e);
+                // Missing config file is not an error; just use defaults
+                if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+                    global.logError("Error reading config: " + e);
+                }
             }
             callback(config);
         });
