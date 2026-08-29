@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.1.9
+# Version 1.2.0
 # ============================================
 
 from __future__ import annotations
@@ -176,6 +176,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.selected_slots = []
         self._selection_update_lock = False
         self._updating_widgets = False
+        self._autostart_daemon_switch = None
 
         self._setup_styles()
         self._build_pages()
@@ -367,11 +368,27 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         monitor_hbox.append(self.monitor_list_box)
         right_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.VERTICAL, 4)
         right_box.set_valign(gtk['Gtk'].Align.END)
+
+        # Horizontal row for refresh and folder icons
+        icon_row = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 4)
+        icon_row.set_halign(gtk['Gtk'].Align.END)
+
+        # Refresh icon button
         refresh_icon_btn = gtk['Gtk'].Button.new_from_icon_name("view-refresh-symbolic")
-        refresh_icon_btn.set_tooltip_text("Refresh images and clear selection")
+        refresh_icon_btn.set_tooltip_text("Refresh images and clears selection")
         refresh_icon_btn.connect('clicked', self._on_refresh_images_clicked)
         refresh_icon_btn.set_halign(gtk['Gtk'].Align.END)
-        right_box.append(refresh_icon_btn)
+        icon_row.append(refresh_icon_btn)
+
+        # Folder icon button (opens the selected wallpaper folder)
+        folder_icon_btn = gtk['Gtk'].Button.new_from_icon_name("folder-symbolic")
+        folder_icon_btn.set_tooltip_text("Open wallpaper folder")
+        folder_icon_btn.connect('clicked', self._on_open_folder_clicked)
+        folder_icon_btn.set_halign(gtk['Gtk'].Align.END)
+        icon_row.append(folder_icon_btn)
+
+        right_box.append(icon_row)
+
         self.apply_btn = gtk['Gtk'].Button.new_with_label("Apply")
         self.apply_btn.add_css_class("suggested-action")
         self.apply_btn.set_valign(gtk['Gtk'].Align.END)
@@ -467,6 +484,11 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         color_dialog.set_title("Choose Solid Color")
         color_btn = gtk['Gtk'].ColorDialogButton.new(color_dialog)
         color_btn.props.rgba = rgba
+        color_btn.set_size_request(24, 24)          # square, smaller
+        color_btn.set_halign(gtk['Gtk'].Align.CENTER)
+        color_btn.set_valign(gtk['Gtk'].Align.CENTER)
+        color_btn.set_margin_start(0)
+        color_btn.set_margin_end(0)
         color_btn.connect('notify::rgba', self._on_color_changed)
         color_row.add_suffix(color_btn)
         color_row.set_activatable_widget(color_btn)
@@ -492,6 +514,13 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         workspace_row.set_subtitle("Different wallpaper for each workspace")
         workspace_row.set_active(self.config.get_bool('per_workspace'))
         workspace_row.connect('notify::active', self._on_workspace_toggled)
+        autostart_daemon_row = gtk['Adw'].SwitchRow.new()
+        autostart_daemon_row.set_title("Start auto services on Login")
+        autostart_daemon_row.set_subtitle("Run background services automatically when you log in")
+        autostart_daemon_row.set_active(self._is_autostart_enabled())
+        autostart_daemon_row.connect('notify::active', self._on_autostart_daemon_toggled)
+        general_settings_group.add(autostart_daemon_row)
+        self._autostart_daemon_switch = autostart_daemon_row
         general_settings_group.add(workspace_row)
         self.workspace_row = workspace_row
         assert self.fullscreen_row is not None, "Fullscreen row not created"
@@ -764,6 +793,51 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         child.add_css_class('wallpaper-child')
         assert child.get_parent() is not None, "Thumbnail child not added to flowbox"
 
+    def _autostart_file_path(self) -> str:
+        return os.path.expanduser('~/.config/autostart/ultraspan-daemon.desktop')
+
+    def _is_autostart_enabled(self) -> bool:
+        return os.path.exists(self._autostart_file_path())
+
+    def _on_autostart_daemon_toggled(self, row, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        enabled = row.get_active()
+        autostart_file = self._autostart_file_path()
+        helper_dir = os.path.expanduser('~/.local/bin')
+        helper_path = os.path.join(helper_dir, 'ultraspan-autostart')
+
+        if enabled:
+            os.makedirs(os.path.dirname(autostart_file), exist_ok=True)
+            os.makedirs(helper_dir, exist_ok=True)
+
+            # Determine ultraspan path
+            script_path = shutil.which('ultraspan') or os.path.expanduser('~/.local/bin/ultraspan')
+
+            # Write helper script
+            with open(helper_path, 'w') as f:
+                f.write("#!/bin/bash\n")
+                f.write("sleep 3\n")
+                f.write(f"setsid nohup {script_path} daemon >/dev/null 2>&1 &\n")
+            os.chmod(helper_path, 0o755)
+
+            # Write valid autostart entry
+            with open(autostart_file, 'w') as f:
+                f.write("[Desktop Entry]\n")
+                f.write("Type=Application\n")
+                f.write("Name=Ultraspan Daemon\n")
+                f.write(f"Exec={helper_path}\n")
+                f.write("X-GNOME-Autostart-enabled=true\n")
+        else:
+            try:
+                os.remove(autostart_file)
+            except FileNotFoundError:
+                pass
+            try:
+                os.remove(helper_path)
+            except FileNotFoundError:
+                pass
+
     # ------------------------------------------------------------------
     # Other helper methods
     # ------------------------------------------------------------------
@@ -908,6 +982,11 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             if self.fullscreen_row.get_active() != new_fullscreen:
                 self.fullscreen_row.set_active(new_fullscreen)
 
+            if self._autostart_daemon_switch is not None:
+                autostart_enabled = self._is_autostart_enabled()
+                if self._autostart_daemon_switch.get_active() != autostart_enabled:
+                    self._autostart_daemon_switch.set_active(autostart_enabled)
+
             new_workspace = self.config.get_bool('per_workspace')
             if self.workspace_row.get_active() != new_workspace:
                 self.workspace_row.set_active(new_workspace)
@@ -1004,6 +1083,20 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 child.badge_label.set_text("")
             child = child.get_next_sibling()
         self._populate_wallpaper_list_async()
+
+    def _on_open_folder_clicked(self, btn: object) -> None:
+        assert btn is not None, "Button cannot be None"
+        folder = self.config.get('wallpaper_folder')
+        if not os.path.isdir(folder):
+            os.makedirs(folder, exist_ok=True)
+
+        try:
+            uri = GLib.filename_to_uri(folder)
+            success = Gio.AppInfo.launch_default_for_uri(uri, None)
+            if not success:
+                raise OSError("No default application for folders")
+        except Exception as e:
+            print(f"Error opening folder: {e}", file=sys.stderr)
 
     def _on_folder_dialog_response(self, dialog: object, result: object) -> None:
         assert dialog is not None, "Dialog cannot be None"
