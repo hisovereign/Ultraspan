@@ -1095,7 +1095,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             success = Gio.AppInfo.launch_default_for_uri(uri, None)
             if not success:
                 raise OSError("No default application for folders")
-        except Exception as e:
+        except (GLib.Error, OSError) as e:
             print(f"Error opening folder: {e}", file=sys.stderr)
 
     def _on_folder_dialog_response(self, dialog: object, result: object) -> None:
