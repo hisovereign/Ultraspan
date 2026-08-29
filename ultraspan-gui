@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.2.0
+# Version 1.3.0
 # ============================================
 
 from __future__ import annotations
@@ -64,6 +64,11 @@ class UltraspanConfig:
             'max_cache_mb': '2000',
             'magick_memory': '2GiB',
             'per_workspace': 'false',
+            'gui_background': '',
+            'gui_font_color': '',
+            'gui_button_color': '',
+            'gui_group_opacity': '0',
+            'gui_skin_enabled': 'false',
             'wallpaper_folder': DEFAULT_FOLDER,
         }
         self.values = self.defaults.copy()
@@ -184,6 +189,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self._monitor_daemon()
         self.connect('notify::visible-page', self._on_visible_page_changed)
         self._update_service_status()
+        self._apply_gui_background()          # add this line
         assert hasattr(self, 'wallpaper_flowbox'), "Wallpaper flowbox not created"
         assert hasattr(self, 'status_page'), "Status page not created"
 
@@ -222,6 +228,13 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             gtk['Gdk'].Display.get_default(),
             css_provider,
             gtk['Gtk'].STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        # Dedicated provider for dynamic background image (to be toggled on/off)
+        self._background_provider = gtk['Gtk'].CssProvider.new()
+        gtk['Gtk'].StyleContext.add_provider_for_display(
+            gtk['Gdk'].Display.get_default(),
+            self._background_provider,
+            gtk['Gtk'].STYLE_PROVIDER_PRIORITY_USER
         )
         assert gtk['Gdk'].Display.get_default() is not None, "No default display available"
 
@@ -412,6 +425,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self._build_general_settings_section(gtk, general_page)
         self._build_backend_section(gtk, general_page)
         self._build_auto_services_section(gtk, general_page)
+        self._build_custom_background_section(gtk, general_page)
 
     def _build_display_mode_section(self, gtk: dict[str, object], page: object) -> None:
         assert isinstance(gtk, dict), "gtk must be dict"
@@ -514,6 +528,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         workspace_row.set_subtitle("Different wallpaper for each workspace")
         workspace_row.set_active(self.config.get_bool('per_workspace'))
         workspace_row.connect('notify::active', self._on_workspace_toggled)
+
         autostart_daemon_row = gtk['Adw'].SwitchRow.new()
         autostart_daemon_row.set_title("Start auto services on Login")
         autostart_daemon_row.set_subtitle("Run background services automatically when you log in")
@@ -621,8 +636,72 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         assert self.status_page is not None, "Status page not created"
         assert self.status_label is not None, "Status label not created"
 
+    def _build_custom_background_section(self, gtk: dict[str, object], page: object) -> None:
+        assert isinstance(gtk, dict), "gtk must be dict"
+        assert page is not None, "Page cannot be None"
+
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("Custom Background")
+        group.set_description("Optional skin for this settings window")
+        page.add(group)
+
+        # Choose image button (Pro-tip Box wrapper)
+        button_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.VERTICAL, 0)
+        button_box.set_margin_top(16)
+        button_box.set_margin_bottom(16)
+
+        choose_bg_btn = gtk['Gtk'].Button.new_with_label("Choose menu background image")
+        choose_bg_btn.set_halign(gtk['Gtk'].Align.FILL)
+        choose_bg_btn.set_hexpand(True)
+        choose_bg_btn.connect('clicked', self._on_choose_gui_background_clicked)
+        
+        button_box.append(choose_bg_btn)
+        group.add(button_box)
+        self._choose_gui_bg_btn = choose_bg_btn
+
+        # Font color picker
+        font_color_row = gtk['Adw'].ActionRow.new()
+        font_color_row.set_title("Font color picker")
+        font_color_row.set_subtitle("Text color for titles and subtitles (picker)")
+        font_color_btn = self._create_color_button(self.config.get('gui_font_color'), self._on_gui_font_color_changed)
+        font_color_row.add_suffix(font_color_btn)
+        font_color_row.set_activatable_widget(font_color_btn)
+        group.add(font_color_row)
+        self._gui_font_color_btn = font_color_btn
+
+        # Button color picker
+        button_color_row = gtk['Adw'].ActionRow.new()
+        button_color_row.set_title("Button color")
+        button_color_row.set_subtitle("Button background when custom background is active")
+        button_color_btn = self._create_color_button(self.config.get('gui_button_color'), self._on_gui_button_color_changed)
+        button_color_row.add_suffix(button_color_btn)
+        button_color_row.set_activatable_widget(button_color_btn)
+        group.add(button_color_row)
+        self._gui_button_color_btn = button_color_btn
+
+        # Group overlay opacity slider
+        opacity_row = gtk['Adw'].ActionRow.new()
+        opacity_row.set_title("Group overlay opacity")
+        opacity_row.set_subtitle("Darken group backgrounds for readability")
+        group_opacity_scale = gtk['Gtk'].Scale.new_with_range(gtk['Gtk'].Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
+        group_opacity_scale.set_value(float(self.config.get('gui_group_opacity') or '0'))
+        group_opacity_scale.set_hexpand(True)
+        group_opacity_scale.connect('value-changed', self._on_gui_group_opacity_changed)
+        opacity_row.add_suffix(group_opacity_scale)
+        opacity_row.set_activatable_widget(group_opacity_scale)
+        group.add(opacity_row)
+        self._gui_group_opacity_scale = group_opacity_scale
+
+        # Toggle at the bottom
+        self._gui_bg_switch = gtk['Adw'].SwitchRow.new()
+        self._gui_bg_switch.set_title("Use custom background")
+        self._gui_bg_switch.set_subtitle("Apply the selected image, colors, or group background")
+        self._gui_bg_switch.set_active(self.config.get_bool('gui_skin_enabled'))
+        self._gui_bg_switch.connect('notify::active', self._on_gui_background_toggled)
+        group.add(self._gui_bg_switch)
+
     # ------------------------------------------------------------------
-    # Helper methods
+    # Helper methods 
     # ------------------------------------------------------------------
     def _on_child_clicked(self, gesture: object, n_press: int, x: float, y: float, child: object) -> None:
         assert child is not None, "Child cannot be None"
@@ -982,10 +1061,33 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             if self.fullscreen_row.get_active() != new_fullscreen:
                 self.fullscreen_row.set_active(new_fullscreen)
 
+            # Sync custom background controls
+            if hasattr(self, '_gui_bg_switch') and self._gui_bg_switch is not None:
+                skin_enabled = self.config.get_bool('gui_skin_enabled')
+                if self._gui_bg_switch.get_active() != skin_enabled:
+                    self._gui_bg_switch.set_active(skin_enabled)
+                self._apply_gui_background()
+
+            # Sync font/button color buttons
+            if hasattr(self, '_gui_font_color_btn') and self._gui_font_color_btn is not None:
+                rgba = gtk['Gdk'].RGBA()
+                rgba.parse(self.config.get('gui_font_color') or '#000000')
+                self._gui_font_color_btn.props.rgba = rgba
+
+            if hasattr(self, '_gui_button_color_btn') and self._gui_button_color_btn is not None:
+                rgba = gtk['Gdk'].RGBA()
+                rgba.parse(self.config.get('gui_button_color') or '#000000')
+                self._gui_button_color_btn.props.rgba = rgba
+
             if self._autostart_daemon_switch is not None:
                 autostart_enabled = self._is_autostart_enabled()
                 if self._autostart_daemon_switch.get_active() != autostart_enabled:
                     self._autostart_daemon_switch.set_active(autostart_enabled)
+
+            if hasattr(self, '_gui_group_opacity_scale') and self._gui_group_opacity_scale is not None:
+                new_opacity = float(self.config.get('gui_group_opacity') or '0')
+                if abs(self._gui_group_opacity_scale.get_value() - new_opacity) > 0.001:
+                    self._gui_group_opacity_scale.set_value(new_opacity)
 
             new_workspace = self.config.get_bool('per_workspace')
             if self.workspace_row.get_active() != new_workspace:
@@ -1007,6 +1109,110 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             self._update_service_status()
         finally:
             self._updating_widgets = False
+
+    def _create_color_button(self, current_hex: str, callback) -> object:
+        gtk = GTK
+        rgba = gtk['Gdk'].RGBA()
+        rgba.parse(current_hex if current_hex else '#000000')
+        dialog = gtk['Gtk'].ColorDialog.new()
+        dialog.set_title("Choose color")
+        btn = gtk['Gtk'].ColorDialogButton.new(dialog)
+        btn.props.rgba = rgba
+        btn.set_size_request(24, 24)
+        btn.set_halign(gtk['Gtk'].Align.CENTER)
+        btn.set_valign(gtk['Gtk'].Align.CENTER)
+        btn.connect('notify::rgba', callback)
+        return btn
+
+    def _on_choose_gui_background_clicked(self, btn: object) -> None:
+        assert btn is not None, "Button cannot be None"
+        gtk = GTK
+        dialog = gtk['Gtk'].FileDialog.new()
+        dialog.set_title("Select Background Image")
+        dialog.open(self, None, self._on_gui_background_file_response)
+
+    def _on_gui_background_file_response(self, dialog: object, result: object) -> None:
+        gtk = GTK
+        try:
+            file = dialog.open_finish(result)
+        except gtk['GLib'].Error:
+            return
+        if file:
+            path = file.get_path()
+            self.config.set('gui_background', path)
+            self._apply_gui_background()
+            if hasattr(self, '_gui_bg_switch'):
+                self._gui_bg_switch.set_active(True)
+
+    def _on_gui_background_toggled(self, row: object, *args: object) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        enabled = row.get_active()
+        self.config.set('gui_skin_enabled', str(enabled).lower())
+        self._apply_gui_background()
+
+    def _on_gui_font_color_changed(self, btn: object, *args: object) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        rgba = btn.props.rgba
+        self.config.set('gui_font_color', rgba.to_string())
+        self._apply_gui_background()
+
+    def _on_gui_button_color_changed(self, btn: object, *args: object) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        rgba = btn.props.rgba
+        self.config.set('gui_button_color', rgba.to_string())
+        self._apply_gui_background()
+
+    def _apply_gui_background(self, force_off: bool = False) -> None:
+        if not hasattr(self, '_background_provider'):
+            return
+        if force_off or not self.config.get_bool('gui_skin_enabled'):
+            self._background_provider.load_from_data(b'')
+            self.remove_css_class('ultraspan-window')
+            return
+
+        bg_image = self.config.get('gui_background')
+        font_color = self.config.get('gui_font_color')
+        button_color = self.config.get('gui_button_color')
+        group_opacity = float(self.config.get('gui_group_opacity') or '0')
+
+        css_parts = []
+
+        if bg_image and os.path.isfile(bg_image):
+            css_parts.append(
+                'window.ultraspan-window {'
+                f' background-image: url("file://{bg_image}");'
+                ' background-size: cover;'
+                ' background-position: center;'
+                ' }'
+            )
+
+        if font_color:
+            css_parts.append(
+                f'window.ultraspan-window * {{ color: {font_color}; }}'
+            )
+
+        if button_color:
+            css_parts.append(
+                f'window.ultraspan-window button {{ background-color: {button_color}; }}'
+            )
+
+        if group_opacity > 0:
+            css_parts.append(
+                f'window.ultraspan-window preferencesgroup {{ background-color: rgba(0, 0, 0, {group_opacity}); }}'
+            )
+
+        if bg_image or font_color or button_color or group_opacity > 0:
+            self.add_css_class('ultraspan-window')
+        else:
+            self.remove_css_class('ultraspan-window')
+
+        if css_parts:
+            self._background_provider.load_from_data(''.join(css_parts).encode())
+        else:
+            self._background_provider.load_from_data(b'')
 
     # ------------------------------------------------------------------
     # Signal handlers (unchanged except assertions)
@@ -1171,6 +1377,13 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             self._run_ultraspan_async(["daemon-stop"])
         gtk['GLib'].timeout_add(2000, self._update_service_status)
         gtk['GLib'].timeout_add(5000, self._update_service_status)
+
+    def _on_gui_group_opacity_changed(self, scale: object, *args: object) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        opacity = scale.get_value()
+        self.config.set('gui_group_opacity', str(opacity))
+        self._apply_gui_background()
 
     # ------------------------------------------------------------------
     # Config monitor
