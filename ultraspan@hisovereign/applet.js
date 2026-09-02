@@ -108,8 +108,17 @@ class UltraspanApplet extends Applet.IconApplet {
 
     on_applet_clicked() {
         this._assert(!this._destroyed, "Applet destroyed");
-        if (!this._destroyed && this.menu) {
+        if (this._destroyed || !this.menu) {
+            return;
+        }
+
+        if (this.menu.isOpen) {
+            // Menu is already open, just close it
             this.menu.toggle();
+        } else {
+            // Rebuild menu synchronously (folder images now sync) and open
+            this._buildMenu();
+            this.menu.open();
         }
     }
 
@@ -270,18 +279,29 @@ class UltraspanApplet extends Applet.IconApplet {
         folderItem.menu.actor.add_style_class_name('ultraspan-submenu');
         this.menu.addMenuItem(folderItem);
 
-        let folder = Gio.File.new_for_path(RANDOM_FOLDER);
-        folder.query_info_async('*', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null,
-            (obj, res) => {
-                try {
-                    obj.query_info_finish(res);
-                    this._getImagesFromFolderAsync(RANDOM_FOLDER, 999, (images) => {
-                        this._populateFolderMenu(folderItem, images);
-                    });
-                } catch (e) {
-                    this._handleFolderQueryError(folderItem, e);
-                }
+        if (!GLib.file_test(RANDOM_FOLDER, GLib.FileTest.IS_DIR)) {
+            const noFolderItem = new PopupMenu.PopupMenuItem(_("Folder does not exist"));
+            noFolderItem.setSensitive(false);
+            noFolderItem.actor.accessible_name = _("Wallpaper folder does not exist");
+            folderItem.menu.addMenuItem(noFolderItem);
+
+            const createItem = new PopupMenu.PopupMenuItem(_("Create folder"));
+            createItem.actor.accessible_name = _("Create wallpaper folder");
+            createItem.actor.accessible_description = _("Create the default wallpaper folder and open it");
+            createItem.connect("activate", () => {
+                this._ensureFolderExistsAsync(RANDOM_FOLDER, () => {
+                    this._rebuildMenu();
+                    if (this.menu) {
+                        this.menu.open();
+                    }
+                });
             });
+            folderItem.menu.addMenuItem(createItem);
+            return;
+        }
+
+        let images = this._getImagesFromFolderSync(RANDOM_FOLDER, 999);
+        this._populateFolderMenu(folderItem, images);
     }
 
     _handleFolderQueryError(folderItem, error) {
@@ -388,7 +408,14 @@ class UltraspanApplet extends Applet.IconApplet {
                 this._showPerMonitorNoMonitors(perMonitorItem);
                 return;
             }
-            this._loadPerMonitorImages(perMonitorItem, monitors);
+
+            if (!GLib.file_test(RANDOM_FOLDER, GLib.FileTest.IS_DIR)) {
+                this._showPerMonitorFolderMissing(perMonitorItem);
+                return;
+            }
+
+            let images = this._getImagesFromFolderSync(RANDOM_FOLDER, 999);
+            this._onPerMonitorImagesLoaded(perMonitorItem, monitors, images);
         });
     }
 
@@ -399,44 +426,10 @@ class UltraspanApplet extends Applet.IconApplet {
         perMonitorItem.menu.addMenuItem(err);
     }
 
-    _loadPerMonitorImages(perMonitorItem, monitors) {
-        let folder = Gio.File.new_for_path(RANDOM_FOLDER);
-        folder.query_info_async('*', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null,
-            (obj, res) => {
-                this._onPerMonitorFolderQueried(obj, res, perMonitorItem, monitors);
-            });
-    }
-
-    _onPerMonitorFolderQueried(obj, res, perMonitorItem, monitors) {
-        try {
-            obj.query_info_finish(res);
-            this._getImagesFromFolderAsync(RANDOM_FOLDER, 999, (images) => {
-                this._onPerMonitorImagesLoaded(perMonitorItem, monitors, images);
-            });
-        } catch (e) {
-            this._handlePerMonitorFolderError(perMonitorItem, e);
-        }
-    }
-
-    _handlePerMonitorFolderError(perMonitorItem, error) {
-        if (error.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
-            this._showPerMonitorFolderMissing(perMonitorItem);
-        } else {
-            this._showPerMonitorFolderError(perMonitorItem);
-        }
-    }
-
     _showPerMonitorFolderMissing(perMonitorItem) {
         let item = new PopupMenu.PopupMenuItem(_("Folder does not exist"));
         item.setSensitive(false);
         item.actor.accessible_name = _("Wallpaper folder does not exist");
-        perMonitorItem.menu.addMenuItem(item);
-    }
-
-    _showPerMonitorFolderError(perMonitorItem) {
-        let item = new PopupMenu.PopupMenuItem(_("Folder error"));
-        item.setSensitive(false);
-        item.actor.accessible_name = _("Folder error");
         perMonitorItem.menu.addMenuItem(item);
     }
 
@@ -1019,31 +1012,29 @@ class UltraspanApplet extends Applet.IconApplet {
         }
     }
 
-    _getImagesFromFolderAsync(folderPath, maxCount, callback) {
-        const images = [];
+    _getImagesFromFolderSync(folderPath, maxCount) {
+        let images = [];
         let dir = Gio.File.new_for_path(folderPath);
-        dir.enumerate_children_async('standard::name', Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, null,
-            (obj, res) => {
-                try {
-                    let enumerator = obj.enumerate_children_finish(res);
-                    this._enumerateNextAsync(enumerator, folderPath, images, maxCount, callback);
-                } catch (e) {
-                    global.logError("Error enumerating directory: " + e);
-                    callback(images);
-                }
-            });
-    }
+        let enumerator = null;
 
-    _enumerateNextAsync(enumerator, folderPath, images, maxCount, callback) {
-        enumerator.next_files_async(10, GLib.PRIORITY_DEFAULT, null, (obj, res) => {
-            try {
-                let files = obj.next_files_finish(res);
-                this._handleFiles(enumerator, files, folderPath, images, maxCount, callback);
-            } catch (e) {
-                global.logError("Error reading files: " + e);
-                callback(images);
+        try {
+            enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        } catch (e) {
+            return images;
+        }
+
+        let info = null;
+        while ((info = enumerator.next_file(null)) !== null && images.length < maxCount) {
+            const fileName = info.get_name();
+            if (/\.(jpg|jpeg|png|webp)$/i.test(fileName)) {
+                const filePath = GLib.build_filenamev([folderPath, fileName]);
+                images.push({ name: fileName, path: filePath });
             }
-        });
+        }
+
+        enumerator.close(null);
+        images.sort((a, b) => a.name.localeCompare(b.name));
+        return images;
     }
 
     _shouldFinishEnumeration(files, currentCount, maxCount) {
