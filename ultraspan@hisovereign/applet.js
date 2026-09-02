@@ -1020,6 +1020,7 @@ class UltraspanApplet extends Applet.IconApplet {
         try {
             enumerator = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
         } catch (e) {
+            global.log("Error enumerating folder: " + e);
             return images;
         }
 
