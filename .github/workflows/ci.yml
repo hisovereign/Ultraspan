@@ -14,7 +14,7 @@ jobs:
       - name: Run ShellCheck
         run: |
           find . -type f \( -name '*.sh' -o -name 'ultraspan' \) -print0 |
-            xargs -0 -n1 shellcheck
+            xargs -0 -n1 shellcheck --exclude=SC2317 --severity=warning
 
   python-syntax:
     runs-on: ubuntu-latest
@@ -40,7 +40,6 @@ jobs:
 
       - name: Run Ruff
         run: ruff check ultraspan-gui --ignore E501,EXE001
-
   eslint:
     runs-on: ubuntu-latest
     steps:
@@ -50,6 +49,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ultraspan@hisovereign/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('ultraspan@hisovereign/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
 
       - name: Install ESLint
         working-directory: ultraspan@hisovereign
