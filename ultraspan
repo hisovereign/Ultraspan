@@ -4,7 +4,7 @@ set -u
 # ============================================
 # Ultraspan - Ultimate Multi‑Monitor Wallpaper Utility
 # ============================================
-# Version 5.3.4 - Brought to you by hisovereign
+# Version 5.4.1 - Refactoring and code-guideline improvements
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -20,12 +20,12 @@ CONFIG[random_interval]=30
 CONFIG[refresh_interval]=480
 CONFIG[multi_random]="false"
 CONFIG[backend]="gsettings"
-CONFIG[max_cache_mb]=2000          # max cache size in MB, 0 = no limit
-CONFIG[magick_memory]="2GiB"       # ImageMagick memory limit
-CONFIG[config_version]=1           # config version for migration
-CONFIG[per_workspace]="false"      # enable per‑workspace wallpapers
+CONFIG[max_cache_mb]=2000
+CONFIG[magick_memory]="2GiB"
+CONFIG[config_version]=1
+CONFIG[per_workspace]="false"
 
-VERSION="5.3.4"
+VERSION="5.4.1"
 CONFIG_DIR="${HOME}/.config/ultraspan"
 CONFIG_FILE="${CONFIG_DIR}/config"
 CACHE_DIR="${HOME}/.cache/ultraspan"
@@ -41,6 +41,55 @@ DAEMON_PIDFILE="${PID_DIR}/daemon.pid"
 
 DEBUG=false
 VERBOSE=false
+WATCHDOG_LIMIT=1000000
+
+# ----------------------------------------------------------------------
+# Assertion helpers
+# ----------------------------------------------------------------------
+assert_file_exists() {
+    local file="$1"
+    if [[ ! -f "$file" ]]; then
+        log "ERROR" "Assertion failed: File not found: $file"
+        return 1
+    fi
+    return 0
+}
+
+assert_dir_exists() {
+    local dir="$1"
+    if [[ ! -d "$dir" ]]; then
+        log "ERROR" "Assertion failed: Directory not found: $dir"
+        return 1
+    fi
+    return 0
+}
+
+assert_positive_int() {
+    local val="$1"
+    if [[ ! "$val" =~ ^[0-9]+$ ]] || [[ "$val" -le 0 ]]; then
+        log "ERROR" "Assertion failed: Not a positive integer: $val"
+        return 1
+    fi
+    return 0
+}
+
+assert_non_negative_int() {
+    local val="$1"
+    if [[ ! "$val" =~ ^[0-9]+$ ]]; then
+        log "ERROR" "Assertion failed: Not a non‑negative integer: $val"
+        return 1
+    fi
+    return 0
+}
+
+assert_command_available() {
+    local cmd="$1"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        log "ERROR" "Assertion failed: Command not found: $cmd"
+        return 1
+    fi
+    return 0
+}
 
 # ----------------------------------------------------------------------
 # ImageMagick detection & memory limit
@@ -73,6 +122,25 @@ log() {
 
 debug_log() {
     [[ "$DEBUG" == "true" ]] && log "DEBUG" "$@"
+    return 0   # always return 0 to avoid propagating [[ ]] return status
+}
+
+# ----------------------------------------------------------------------
+# URL-encode a file path for gsettings
+# ----------------------------------------------------------------------
+url_encode() {
+    local string="$1"
+    local result=""
+    local i c
+    for ((i=0; i<${#string}; i++)); do
+        c="${string:i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~-]) result+="$c" ;;
+            '/') result+='/' ;;
+            *) result+="%$(printf '%02X' "'$c")" ;;
+        esac
+    done
+    printf '%s' "$result"
 }
 
 # ----------------------------------------------------------------------
@@ -117,12 +185,11 @@ migrate_config() {
     local current_version="${CONFIG[config_version]:-0}"
     if (( current_version < 1 )); then
         log "INFO" "Migrating config to version 1"
-        # Ensure new keys exist
         CONFIG[max_cache_mb]=2000
         CONFIG[magick_memory]="2GiB"
         CONFIG[per_workspace]="false"
         CONFIG[config_version]=1
-        update_config config_version 1   # rewrite config file
+        update_config config_version 1
     fi
 }
 
@@ -137,7 +204,6 @@ load_config() {
             fi
         done < "$CONFIG_FILE"
     fi
-    # Set defaults for missing keys
     : "${CONFIG[mode]:=zoom}"
     : "${CONFIG[bg_type]:=blur}"
     : "${CONFIG[blur]:=15}"
@@ -151,12 +217,12 @@ load_config() {
     : "${CONFIG[magick_memory]:=2GiB}"
     : "${CONFIG[per_workspace]:=false}"
     : "${CONFIG[config_version]:=1}"
-    # Run migration if needed
     migrate_config
 }
 
 update_config() {
     local key="$1" value="$2"
+    [[ -n "$key" ]] || { log "ERROR" "Empty config key"; return 1; }
     CONFIG["$key"]="$value"
     local temp_file
     temp_file="$(mktemp)"
@@ -172,7 +238,7 @@ update_config() {
 # ----------------------------------------------------------------------
 trim_cache() {
     local max_mb="${CONFIG[max_cache_mb]}"
-    [[ "$max_mb" -eq 0 ]] && return   # no limit
+    [[ "$max_mb" -eq 0 ]] && return
     local current_size
     current_size="$(du -sm "$CACHE_DIR" 2>/dev/null | cut -f1)"
     while [[ "$current_size" -gt "$max_mb" ]]; do
@@ -212,30 +278,31 @@ get_monitor_info() {
         log "ERROR" "No monitors detected. Cannot continue."
         return 1
     fi
+    log "INFO" "Detected $MONITOR_COUNT monitors."
+    return 0
 }
 
 # ----------------------------------------------------------------------
 # Workspace helpers
 # ----------------------------------------------------------------------
 get_current_workspace() {
-    if ! command -v xdotool &>/dev/null; then
-        log "WARN" "xdotool not found; per‑workspace features may not work correctly."
-        echo 0
-        return
-    fi
+    assert_command_available xdotool || { echo 0; return 0; }
     xdotool get_desktop 2>/dev/null || echo 0
 }
 
 get_state_file() {
     local ws="${1:-$(get_current_workspace)}"
+    assert_non_negative_int "$ws" || ws=0
     echo "${CONFIG_DIR}/state_workspace_${ws}"
 }
 
 get_total_span() {
-    get_monitor_info || exit 1
+    get_monitor_info || { log "ERROR" "Failed to get monitor info"; return 1; }
     TOTAL_WIDTH=$((MAX_X - MIN_X))
     TOTAL_HEIGHT=$((MAX_Y - MIN_Y))
+    log "INFO" "Span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
     debug_log "Span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
+    return 0
 }
 
 # ----------------------------------------------------------------------
@@ -254,6 +321,10 @@ get_file_mtime() {
 
 process_image_for_area() {
     local image="$1" area_w="$2" area_h="$3" mode="$4"
+    assert_file_exists "$image" || return 1
+    assert_positive_int "$area_w" || return 1
+    assert_positive_int "$area_h" || return 1
+
     local outfile
     outfile="$(mktemp)" || { log "ERROR" "Failed to create temp file"; return 1; }
 
@@ -289,37 +360,29 @@ process_image_for_area() {
         *) log "ERROR" "Unknown mode: $mode"; return 1 ;;
     esac
     echo "$outfile"
+    return 0
 }
 
 # ----------------------------------------------------------------------
-# Set wallpaper
+# Set wallpaper - split into smaller functions
 # ----------------------------------------------------------------------
-set_wallpaper() {
-    local image="$1" mode="${2:-${CONFIG[mode]}}" force="${3:-false}"
-    [[ -f "$image" ]] || { log "ERROR" "File not found: $image"; return 1; }
+_build_wallpaper_cache() {
+    local image="$1" mode="$2" force="$3"
+    local abs_image mtime safe_abs key_string cache_key CACHE_FILE
+    local img_w img_h
 
-    log "INFO" "Setting wallpaper: $(basename "$image") (mode $mode)"
-    get_total_span
-
-    mkdir -p "$CACHE_DIR" "$CONFIG_DIR"
-
-    local abs_image
     abs_image="$(readlink -f "$image")"
-    local mtime
     mtime="$(get_file_mtime "$abs_image")"
-    local safe_abs
     safe_abs="$(safe_filename "$abs_image")"
-    local key_string="${safe_abs}|${mtime}|${mode}|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
-    local cache_key
+    key_string="${safe_abs}|${mtime}|${mode}|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
     cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
-    local CACHE_FILE="${CACHE_DIR}/${cache_key}.jpg"
+    CACHE_FILE="${CACHE_DIR}/${cache_key}.jpg"
+    log "INFO" "Cache file: $CACHE_FILE"
 
-    # Trim cache before writing new file
     trim_cache
 
     if [[ "$force" == "true" ]] || [[ ! -f "$CACHE_FILE" ]]; then
         log "INFO" "Processing image (cache miss or forced)..."
-        local img_w img_h
         img_w="$($IM_IDENTIFY -format "%w" "$image" 2>/dev/null)" || img_w=0
         img_h="$($IM_IDENTIFY -format "%h" "$image" 2>/dev/null)" || img_h=0
         debug_log "Original: ${img_w}x${img_h}"
@@ -377,12 +440,21 @@ set_wallpaper() {
                 ;;
             *) log "ERROR" "Unknown mode: $mode"; return 1 ;;
         esac
-        [[ -f "$CACHE_FILE" ]] || { log "ERROR" "Image processing failed"; return 1; }
+        if [[ ! -f "$CACHE_FILE" ]]; then
+            log "ERROR" "Image processing failed: $CACHE_FILE not created."
+            return 1
+        fi
+        log "INFO" "Cache file created successfully."
     else
         log "INFO" "Using cached image"
         touch "$CACHE_FILE"
     fi
+    echo "$CACHE_FILE"
+    return 0
+}
 
+_save_wallpaper_state() {
+    local image="$1" mode="$2"
     {
         echo "$image"
         echo "$mode"
@@ -394,22 +466,65 @@ set_wallpaper() {
         fi
         date '+%Y-%m-%d %H:%M:%S'
     } > "$STATE_FILE"
-
-    case "${CONFIG[backend]}" in
-        feh)
-            feh --bg-scale "$CACHE_FILE" 2>/dev/null || log "WARN" "feh failed"
-            ;;
-        nitrogen)
-            nitrogen --set-scaled "$CACHE_FILE" 2>/dev/null || log "WARN" "nitrogen failed"
-            ;;
-        *)
-            gsettings set org.cinnamon.desktop.background picture-uri "file://$CACHE_FILE"
-            gsettings set org.cinnamon.desktop.background picture-options "spanned"
-            ;;
-    esac
-    log "INFO" "Wallpaper set successfully."
+    log "INFO" "State saved to $STATE_FILE"
+    return 0
 }
 
+_apply_wallpaper_backend() {
+    local cache_file="$1"
+    assert_file_exists "$cache_file" || return 1
+
+    local backend="${CONFIG[backend]}"
+    log "INFO" "Applying wallpaper with backend: $backend, file: $cache_file"
+
+    case "$backend" in
+        feh)
+            feh --bg-scale "$cache_file" 2>/dev/null || { log "WARN" "feh failed"; return 1; }
+            ;;
+        nitrogen)
+            nitrogen --set-scaled "$cache_file" 2>/dev/null || { log "WARN" "nitrogen failed"; return 1; }
+            ;;
+        *)
+            # gsettings: URL-encode the path
+            local encoded_path
+            encoded_path="$(url_encode "$cache_file")"
+            local uri="file://$encoded_path"
+            log "INFO" "gsettings URI: $uri"
+            gsettings set org.cinnamon.desktop.background picture-uri "$uri" || {
+                log "ERROR" "gsettings picture-uri failed"
+                return 1
+            }
+            gsettings set org.cinnamon.desktop.background picture-options "spanned" || {
+                log "ERROR" "gsettings picture-options failed"
+                return 1
+            }
+            ;;
+    esac
+    log "INFO" "Wallpaper applied successfully."
+    return 0
+}
+
+set_wallpaper() {
+    local image="$1" mode="${2:-${CONFIG[mode]}}" force="${3:-false}"
+    local cache_file
+
+    log "INFO" "set_wallpaper called with image: $image, mode: $mode, force: $force"
+    assert_file_exists "$image" || return 1
+    get_total_span || return 1
+
+    mkdir -p "$CACHE_DIR" "$CONFIG_DIR"
+
+    cache_file="$(_build_wallpaper_cache "$image" "$mode" "$force")" || return 1
+    _save_wallpaper_state "$image" "$mode" || return 1
+    _apply_wallpaper_backend "$cache_file" || return 1
+
+    log "INFO" "Wallpaper set successfully."
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Per‑monitor wallpaper - split into smaller functions
+# ----------------------------------------------------------------------
 _create_background_canvas() {
     local first_image="$1"
     local canvas
@@ -420,6 +535,7 @@ _create_background_canvas() {
         $IM_CMD -size "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" "xc:${CONFIG[color]}" "$canvas"
     fi
     echo "$canvas"
+    return 0
 }
 
 _process_monitor_images_parallel() {
@@ -428,15 +544,6 @@ _process_monitor_images_parallel() {
     local -a outfiles
     local -a pids
     local i
-
-    # Trap to clean up temporary files on exit (normal or error)
-    # shellcheck disable=SC2317  # trap callback appears unreachable to ShellCheck
-    cleanup_temp() {
-        for f in "${outfiles[@]}"; do
-            [[ -f "$f" ]] && rm -f "$f"
-        done
-    }
-    trap cleanup_temp EXIT
 
     for i in $(seq 0 $((MONITOR_COUNT-1))); do
         local outfile
@@ -447,20 +554,21 @@ _process_monitor_images_parallel() {
     done
     wait "${pids[@]}"
 
-    # Check each process success
     for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local temp_file="${outfiles[i]}"
         local path_from_file
-        path_from_file="$(cat "${outfiles[i]}")"
+        path_from_file="$(cat "$temp_file")"
         if [[ -z "$path_from_file" ]] || [[ ! -f "$path_from_file" ]]; then
             log "ERROR" "Failed to process image for monitor $i"
+            for f in "${outfiles[@]}"; do [[ -f "$f" ]] && rm -f "$f"; done
             return 1
         fi
+        rm -f "$temp_file"
         outfiles[i]="$path_from_file"
     done
 
-    # Success: print the processed file paths and disable the trap
-    trap - EXIT
     printf '%s\n' "${outfiles[@]}"
+    return 0
 }
 
 _compose_per_monitor_canvas() {
@@ -488,58 +596,47 @@ _compose_per_monitor_canvas() {
         fi
         rm -f "$proc"
     done
+    return 0
 }
 
-# ----------------------------------------------------------------------
-# Per‑monitor wallpaper (parallel)
-# ----------------------------------------------------------------------
-set_per_monitor_wallpaper() {
-    local images=("$@")
-    local mode="${images[-1]}"
-    case "$mode" in zoom|fit|center) unset 'images[-1]' ;; *) mode="${CONFIG[mode]}" ;; esac
-
-    get_monitor_info
-    if [[ ${#images[@]} -ne $MONITOR_COUNT ]]; then
-        log "ERROR" "Provide exactly $MONITOR_COUNT image(s)."
-        return 1
-    fi
-    for img in "${images[@]}"; do [[ -f "$img" ]] || { log "ERROR" "File not found: $img"; return 1; }; done
-
-    log "INFO" "Setting per‑monitor wallpaper ($MONITOR_COUNT monitors)"
-    get_total_span
-    mkdir -p "$CACHE_DIR"
-
+_compute_per_monitor_cache_key() {
+    local mode="$1"; shift
+    local -a imgs=("$@")
     local key_string="${mode}|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
-    for img in "${images[@]}"; do
+    for img in "${imgs[@]}"; do
+        local abs_img safe_abs
         abs_img="$(readlink -f "$img")"
         safe_abs="$(safe_filename "$abs_img")"
         key_string="${key_string}|${safe_abs}|$(get_file_mtime "$abs_img")"
     done
-
     local cache_key
     cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
-    local CACHE_FILE="${CACHE_DIR}/${cache_key}.jpg"
+    echo "$cache_key"
+    return 0
+}
 
-    trim_cache
+_generate_per_monitor_wallpaper() {
+    local mode="$1"
+    local cache_file="$2"
+    shift 2
+    local -a imgs=("$@")
+    local bg_canvas
+    local -a processed
 
-    if [[ ! -f "$CACHE_FILE" ]]; then
-        log "INFO" "Processing per‑monitor images in parallel..."
+    bg_canvas="$(_create_background_canvas "${imgs[0]}")" || return 1
+    readarray -t processed < <(_process_monitor_images_parallel "$mode" "${imgs[@]}") || return 1
+    _compose_per_monitor_canvas "$mode" "$bg_canvas" "${processed[@]}" || return 1
 
-        local bg_canvas
-        bg_canvas="$(_create_background_canvas "${images[0]}")" || return 1
+    $IM_CMD "$bg_canvas" -quality 95 "$cache_file" || { log "ERROR" "Failed to write final image"; return 1; }
+    rm -f "$bg_canvas"
+    return 0
+}
 
-        local -a processed
-        readarray -t processed < <(_process_monitor_images_parallel "$mode" "${images[@]}")
-        _compose_per_monitor_canvas "$mode" "$bg_canvas" "${processed[@]}"
-
-        $IM_CMD "$bg_canvas" -quality 95 "$CACHE_FILE"
-        rm -f "$bg_canvas"
-    else
-        log "INFO" "Using cached per‑monitor image"
-    fi
-
+_save_per_monitor_state() {
+    local mode="$1"; shift
+    local -a imgs=("$@")
     local imgs_string
-    imgs_string="$(printf "|%s" "${images[@]}")"
+    imgs_string="$(printf "|%s" "${imgs[@]}")"
     imgs_string="${imgs_string:1}"
     {
         echo "per-monitor:$imgs_string"
@@ -548,24 +645,71 @@ set_per_monitor_wallpaper() {
         if [[ "${CONFIG[bg_type]}" == "blur" ]]; then echo "${CONFIG[blur]}"; else echo "${CONFIG[color]}"; fi
         date '+%Y-%m-%d %H:%M:%S'
     } > "$STATE_FILE"
+    return 0
+}
 
-    case "${CONFIG[backend]}" in
-        feh) feh --bg-scale "$CACHE_FILE" ;;
-        nitrogen) nitrogen --set-scaled "$CACHE_FILE" ;;
-        *) gsettings set org.cinnamon.desktop.background picture-uri "file://$CACHE_FILE"
-           gsettings set org.cinnamon.desktop.background picture-options "spanned" ;;
+_apply_per_monitor_backend() {
+    local cache_file="$1"
+    assert_file_exists "$cache_file" || return 1
+
+    local backend="${CONFIG[backend]}"
+    log "INFO" "Applying per-monitor wallpaper with backend: $backend"
+    case "$backend" in
+        feh) feh --bg-scale "$cache_file" ;;
+        nitrogen) nitrogen --set-scaled "$cache_file" ;;
+        *)
+            local encoded_path
+            encoded_path="$(url_encode "$cache_file")"
+            local uri="file://$encoded_path"
+            gsettings set org.cinnamon.desktop.background picture-uri "$uri" || return 1
+            gsettings set org.cinnamon.desktop.background picture-options "spanned" || return 1
+            ;;
     esac
+    return 0
+}
+
+set_per_monitor_wallpaper() {
+    local images=("$@")
+    local mode="${images[-1]}"
+    local cache_key CACHE_FILE
+
+    case "$mode" in zoom|fit|center) unset 'images[-1]' ;; *) mode="${CONFIG[mode]}" ;; esac
+
+    get_monitor_info || return 1
+    if [[ ${#images[@]} -ne $MONITOR_COUNT ]]; then
+        log "ERROR" "Provide exactly $MONITOR_COUNT image(s)."
+        return 1
+    fi
+    for img in "${images[@]}"; do
+        assert_file_exists "$img" || return 1
+    done
+
+    log "INFO" "Setting per‑monitor wallpaper ($MONITOR_COUNT monitors)"
+    get_total_span || return 1
+    mkdir -p "$CACHE_DIR"
+
+    cache_key="$(_compute_per_monitor_cache_key "$mode" "${images[@]}")" || return 1
+    CACHE_FILE="${CACHE_DIR}/${cache_key}.jpg"
+    trim_cache
+
+    if [[ ! -f "$CACHE_FILE" ]]; then
+        log "INFO" "Processing per‑monitor images..."
+        _generate_per_monitor_wallpaper "$mode" "$CACHE_FILE" "${images[@]}" || return 1
+    else
+        log "INFO" "Using cached per‑monitor image"
+    fi
+
+    _save_per_monitor_state "$mode" "${images[@]}" || return 1
+    _apply_per_monitor_backend "$CACHE_FILE" || return 1
     log "INFO" "Per‑monitor wallpaper set."
+    return 0
 }
 
 # ----------------------------------------------------------------------
 # Refresh and helper functions
 # ----------------------------------------------------------------------
 refresh_wallpaper() {
-    if [[ ! -f "$STATE_FILE" ]]; then
-        log "WARN" "No wallpaper state found; doing nothing."
-        return 1
-    fi
+    assert_file_exists "$STATE_FILE" || { log "WARN" "No wallpaper state found"; return 1; }
 
     local recent_line mode saved_bg_type saved_blur_or_color
     recent_line="$(head -n1 "$STATE_FILE")"
@@ -576,12 +720,10 @@ refresh_wallpaper() {
     [[ -z "$mode" ]] && mode="${CONFIG[mode]}"
     [[ -z "$saved_bg_type" ]] && saved_bg_type="${CONFIG[bg_type]}"
 
-    # Save current global settings (we'll restore them later)
     local old_bg_type="${CONFIG[bg_type]}"
     local old_blur="${CONFIG[blur]}"
     local old_color="${CONFIG[color]}"
 
-    # Temporarily apply the workspace’s saved settings
     CONFIG[bg_type]="$saved_bg_type"
     if [[ "$saved_bg_type" == "blur" ]]; then
         CONFIG[blur]="${saved_blur_or_color:-${CONFIG[blur]}}"
@@ -607,10 +749,10 @@ refresh_wallpaper() {
         fi
     fi
 
-    # Restore the original global settings
     CONFIG[bg_type]="$old_bg_type"
     CONFIG[blur]="$old_blur"
     CONFIG[color]="$old_color"
+    return 0
 }
 
 is_fullscreen_active() {
@@ -626,6 +768,8 @@ is_fullscreen_active() {
 pick_random_image() {
     local dir="$1"
     local images=()
+    assert_dir_exists "$dir" || return 1
+
     while IFS= read -r -d $'\0' file; do
         images+=("$file")
     done < <(find "$dir" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.webp" \) -print0)
@@ -634,12 +778,16 @@ pick_random_image() {
         return 1
     fi
     echo "${images[RANDOM % ${#images[@]}]}"
+    return 0
 }
 
 start_random_mode() {
     local directory="$1" mode="${2:-${CONFIG[mode]}}"
     local interval="${CONFIG[random_interval]}"
-    [[ -d "$directory" ]] || { log "ERROR" "Directory not found: $directory"; return 1; }
+    local first_image
+    local iterations=0
+
+    assert_dir_exists "$directory" || return 1
 
     {
         echo "directory=$directory"
@@ -648,29 +796,36 @@ start_random_mode() {
         echo "pid=$$"
     } > "$RANDOM_FILE"
 
-    local first_image
     first_image="$(pick_random_image "$directory")" || return 1
-    set_wallpaper "$first_image" "$mode"
+    set_wallpaper "$first_image" "$mode" || return 1
+
     (
-        while true; do
+        while (( iterations < WATCHDOG_LIMIT )); do
+            ((iterations++))
             sleep $((interval * 60))
             [[ -f "$RANDOM_FILE" ]] || exit 0
             local new_img
             new_img="$(pick_random_image "$directory")" || continue
             set_wallpaper "$new_img" "$mode"
         done
+        log "ERROR" "Random rotation loop exceeded limit. Exiting."
+        exit 0
     ) &
     echo $! >> "$RANDOM_FILE"
     log "INFO" "Random rotation started (PID $!)"
+    return 0
 }
 
 start_random_multi_mode() {
     local directory="$1" mode="${2:-${CONFIG[mode]}}"
     local interval="${CONFIG[random_interval]}"
-    [[ -d "$directory" ]] || { log "ERROR" "Directory not found"; return 1; }
-    get_monitor_info
-    local N=$MONITOR_COUNT
-    local images=()
+    local N images=()
+    local iterations=0
+
+    assert_dir_exists "$directory" || return 1
+    get_monitor_info || return 1
+    N=$MONITOR_COUNT
+
     while IFS= read -r -d $'\0' file; do
         images+=("$file")
     done < <(find "$directory" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.webp" \) -print0)
@@ -706,31 +861,36 @@ start_random_multi_mode() {
 
     local first_set
     readarray -t first_set < <(pick_random_set)
-    set_per_monitor_wallpaper "${first_set[@]}" "$mode"
+    set_per_monitor_wallpaper "${first_set[@]}" "$mode" || return 1
 
     (
-        while true; do
+        while (( iterations < WATCHDOG_LIMIT )); do
+            ((iterations++))
             sleep $((interval * 60))
             [[ -f "$RANDOM_FILE" ]] || exit 0
             local new_set
             readarray -t new_set < <(pick_random_set)
             set_per_monitor_wallpaper "${new_set[@]}" "$mode"
         done
+        log "ERROR" "Random multi rotation loop exceeded limit. Exiting."
+        exit 0
     ) &
     echo $! >> "$RANDOM_FILE"
     log "INFO" "Random multi rotation started (PID $!)"
+    return 0
 }
 
 stop_random_mode() {
     if [[ -f "$RANDOM_FILE" ]]; then
         local pid
         pid="$(tail -n1 "$RANDOM_FILE")"
-        kill "$pid" 2>/dev/null
+        kill "$pid" 2>/dev/null || true
         rm -f "$RANDOM_FILE"
         log "INFO" "Random rotation stopped."
     else
         log "WARN" "Random rotation not active."
     fi
+    return 0
 }
 
 # ----------------------------------------------------------------------
@@ -738,9 +898,11 @@ stop_random_mode() {
 # ----------------------------------------------------------------------
 start_refresh_mode() {
     local interval="${1:-${CONFIG[refresh_interval]}}"
-    [[ "$interval" =~ ^[0-9]+$ ]] || { log "ERROR" "Interval must be a number (minutes)"; return 1; }
+    local refresh_pid
+    local iterations=0
 
-    stop_refresh_mode   # ensure no stale processes
+    assert_positive_int "$interval" || return 1
+    stop_refresh_mode
     sleep 0.5
 
     mkdir -p "$CONFIG_DIR"
@@ -750,16 +912,19 @@ start_refresh_mode() {
     } > "$REFRESH_FILE"
 
     do_refresh() {
-        while true; do
+        while (( iterations < WATCHDOG_LIMIT )); do
+            ((iterations++))
             sleep $((interval * 60))
             [[ -f "$REFRESH_FILE" ]] || exit 0
             log "INFO" "Auto-refreshing wallpaper"
             refresh_wallpaper
         done
+        log "ERROR" "Refresh loop exceeded limit. Exiting."
+        exit 0
     }
 
     do_refresh &
-    local refresh_pid=$!
+    refresh_pid=$!
     echo $refresh_pid >> "$REFRESH_FILE"
     log "INFO" "Periodic refresh started (PID $refresh_pid)"
 
@@ -773,18 +938,57 @@ start_refresh_mode() {
         echo $! > "$LAYOUT_MONITOR_PIDFILE"
     fi
 
-    monitor_workspace &
-    echo $! >> "$LAYOUT_MONITOR_PIDFILE"
+    if [[ "${CONFIG[per_workspace]}" == "true" ]]; then
+        monitor_workspace &
+        echo $! >> "$LAYOUT_MONITOR_PIDFILE"
+    fi
+    return 0
 }
 
+# ----------------------------------------------------------------------
+# Stop refresh mode - PID-based (robust version)
+# ----------------------------------------------------------------------
 stop_refresh_mode() {
-    # Kill all refresh-related processes aggressively
+    # Kill the main refresh process from REFRESH_FILE
+    if [[ -f "$REFRESH_FILE" ]]; then
+        local refresh_pid
+        refresh_pid="$(tail -n1 "$REFRESH_FILE")"
+        if [[ -n "$refresh_pid" ]] && kill -0 "$refresh_pid" 2>/dev/null; then
+            kill "$refresh_pid" 2>/dev/null || true
+        fi
+        rm -f "$REFRESH_FILE"
+    fi
+
+    # Kill fullscreen monitor from its PID file
+    if [[ -f "$FULLSCREEN_FILE" ]]; then
+        local fs_pid
+        fs_pid="$(cat "$FULLSCREEN_FILE")"
+        if [[ -n "$fs_pid" ]] && kill -0 "$fs_pid" 2>/dev/null; then
+            kill "$fs_pid" 2>/dev/null || true
+        fi
+        rm -f "$FULLSCREEN_FILE"
+    fi
+
+    # Kill layout monitor from its PID file (may contain multiple PIDs: layout, workspace)
+    if [[ -f "$LAYOUT_MONITOR_PIDFILE" ]]; then
+        local pids
+        pids="$(cat "$LAYOUT_MONITOR_PIDFILE")"
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+            fi
+        done
+        rm -f "$LAYOUT_MONITOR_PIDFILE"
+    fi
+
+    # Fallback: pkill any remaining processes (just in case)
     pkill -f "ultraspan.*refresh" 2>/dev/null || true
     pkill -f "ultraspan.*monitor_fullscreen" 2>/dev/null || true
     pkill -f "ultraspan.*monitor_layout" 2>/dev/null || true
     pkill -f "ultraspan.*monitor_workspace" 2>/dev/null || true
-    rm -f "$REFRESH_FILE" "$FULLSCREEN_FILE"
+
     log "INFO" "Periodic refresh stopped."
+    return 0
 }
 
 # ----------------------------------------------------------------------
@@ -792,7 +996,9 @@ stop_refresh_mode() {
 # ----------------------------------------------------------------------
 monitor_fullscreen() {
     local was_fullscreen=false
-    while true; do
+    local iterations=0
+    while (( iterations < WATCHDOG_LIMIT )); do
+        ((iterations++))
         sleep 2
         if is_fullscreen_active; then
             if [[ "$was_fullscreen" == false ]]; then
@@ -800,8 +1006,8 @@ monitor_fullscreen() {
                 local refresh_pid random_pid
                 [[ -f "$REFRESH_FILE" ]] && refresh_pid="$(tail -n1 "$REFRESH_FILE")"
                 [[ -f "$RANDOM_FILE" ]] && random_pid="$(tail -n1 "$RANDOM_FILE")"
-                [[ -n "$refresh_pid" ]] && kill -STOP "$refresh_pid" 2>/dev/null
-                [[ -n "$random_pid" ]] && kill -STOP "$random_pid" 2>/dev/null
+                [[ -n "$refresh_pid" ]] && kill -STOP "$refresh_pid" 2>/dev/null || true
+                [[ -n "$random_pid" ]] && kill -STOP "$random_pid" 2>/dev/null || true
                 was_fullscreen=true
             fi
         else
@@ -810,17 +1016,21 @@ monitor_fullscreen() {
                 local refresh_pid random_pid
                 [[ -f "$REFRESH_FILE" ]] && refresh_pid="$(tail -n1 "$REFRESH_FILE")"
                 [[ -f "$RANDOM_FILE" ]] && random_pid="$(tail -n1 "$RANDOM_FILE")"
-                [[ -n "$refresh_pid" ]] && kill -CONT "$refresh_pid" 2>/dev/null
-                [[ -n "$random_pid" ]] && kill -CONT "$random_pid" 2>/dev/null
+                [[ -n "$refresh_pid" ]] && kill -CONT "$refresh_pid" 2>/dev/null || true
+                [[ -n "$random_pid" ]] && kill -CONT "$random_pid" 2>/dev/null || true
                 was_fullscreen=false
             fi
         fi
     done
+    log "ERROR" "Fullscreen monitor exceeded limit. Exiting."
+    exit 0
 }
 
 monitor_layout() {
     local last_layout=""
-    while true; do
+    local iterations=0
+    while (( iterations < WATCHDOG_LIMIT )); do
+        ((iterations++))
         sleep 2
         local current_layout
         current_layout="$(xrandr --current --listmonitors 2>/dev/null | md5sum | cut -d' ' -f1)"
@@ -830,15 +1040,19 @@ monitor_layout() {
         fi
         last_layout="$current_layout"
     done
+    log "ERROR" "Layout monitor exceeded limit. Exiting."
+    exit 0
 }
 
 # ----------------------------------------------------------------------
-# Workspace change monitor (polling, reliable across Cinnamon versions)
+# Workspace change monitor
 # ----------------------------------------------------------------------
 monitor_workspace() {
     sleep 2
     local last_ws=""
-    while true; do
+    local iterations=0
+    while (( iterations < WATCHDOG_LIMIT )); do
+        ((iterations++))
         load_config
         local new_ws
         new_ws="$(xdotool get_desktop 2>/dev/null || echo 0)"
@@ -852,6 +1066,8 @@ monitor_workspace() {
         fi
         sleep 1
     done
+    log "ERROR" "Workspace monitor exceeded limit. Exiting."
+    exit 0
 }
 
 # ----------------------------------------------------------------------
@@ -859,45 +1075,50 @@ monitor_workspace() {
 # ----------------------------------------------------------------------
 start_daemon() {
     local mode="${1:-background}"
-    mkdir -p "$PID_DIR"
+    local iterations=0
 
-    # Ensure no other daemon is running
+    mkdir -p "$PID_DIR"
     if [[ -f "$DAEMON_PIDFILE" ]] && kill -0 "$(cat "$DAEMON_PIDFILE")" 2>/dev/null; then
         log "ERROR" "Daemon already running (PID $(cat "$DAEMON_PIDFILE"))."
         return 1
     fi
 
-    acquire_lock
-    # Stop any existing refresh/random to avoid duplicates
+    acquire_lock || return 1
     stop_refresh_mode
     stop_random_mode
     release_lock
 
     log "INFO" "Starting ultraspan daemon (mode: $mode)..."
 
-    # Start services inside a subshell for background mode,
-    # or directly for foreground/oneshot.
     case "$mode" in
         foreground)
             echo "$$" > "$DAEMON_PIDFILE"
-            start_refresh_mode "${CONFIG[refresh_interval]}"
-            start_saved_random
-            while true; do sleep 3600; done
+            start_refresh_mode "${CONFIG[refresh_interval]}" || return 1
+            start_saved_random || return 1
+            while (( iterations < WATCHDOG_LIMIT )); do
+                ((iterations++))
+                sleep 3600
+            done
+            log "ERROR" "Daemon idle loop exceeded limit. Exiting."
+            exit 0
             ;;
         oneshot)
             echo "$$" > "$DAEMON_PIDFILE"
-            start_refresh_mode "${CONFIG[refresh_interval]}"
-            start_saved_random
+            start_refresh_mode "${CONFIG[refresh_interval]}" || return 1
+            start_saved_random || return 1
             exit 0
             ;;
         *)
-            # Background: fork a child that does all the work,
-            # and the parent exits immediately.
             (
                 echo "$BASHPID" > "$DAEMON_PIDFILE"
-                start_refresh_mode "${CONFIG[refresh_interval]}"
-                start_saved_random
-                while true; do sleep 3600; done
+                start_refresh_mode "${CONFIG[refresh_interval]}" || exit 1
+                start_saved_random || exit 1
+                while (( iterations < WATCHDOG_LIMIT )); do
+                    ((iterations++))
+                    sleep 3600
+                done
+                log "ERROR" "Daemon idle loop exceeded limit. Exiting."
+                exit 0
             ) &
             disown
             log "INFO" "Daemon sent to background."
@@ -906,7 +1127,6 @@ start_daemon() {
     esac
 }
 
-# Helper to start random if its state file exists
 start_saved_random() {
     if [[ -f "$RANDOM_FILE" ]]; then
         local dir mode multi
@@ -919,12 +1139,13 @@ start_saved_random() {
         done < "$RANDOM_FILE"
         if [[ -n "$dir" ]]; then
             if [[ "$multi" == "true" ]]; then
-                start_random_multi_mode "$dir" "$mode"
+                start_random_multi_mode "$dir" "$mode" || return 1
             else
-                start_random_mode "$dir" "$mode"
+                start_random_mode "$dir" "$mode" || return 1
             fi
         fi
     fi
+    return 0
 }
 
 # ----------------------------------------------------------------------
@@ -938,19 +1159,14 @@ data_wipe_ultraspan() {
         echo "Aborted."
         return 0
     fi
-    
-    # Release lock before stopping daemon (we will remove the lock file later)
-    release_lock 
 
-    # Stop daemon and services first
+    release_lock
     stop_daemon
     stop_refresh_mode
     stop_random_mode
 
-    # Remove config, cache, PID dir, lock file
     rm -rf "$CONFIG_DIR" "$CACHE_DIR" "$PID_DIR" "$LOCK_FILE"
 
-    # Reset wallpaper to default
     local default_wp="/usr/share/backgrounds/linuxmint/default_background.jpg"
     if [[ -f "$default_wp" ]]; then
         gsettings set org.cinnamon.desktop.background picture-uri "file://$default_wp"
@@ -960,6 +1176,7 @@ data_wipe_ultraspan() {
     gsettings set org.cinnamon.desktop.background picture-options "zoom"
 
     echo "All ultraspan data removed. You may now delete the script itself."
+    return 0
 }
 
 # ----------------------------------------------------------------------
@@ -970,58 +1187,20 @@ stop_daemon() {
         local pid
         pid="$(cat "$DAEMON_PIDFILE")"
         if kill -0 "$pid" 2>/dev/null; then
-            kill -TERM "$pid" 2>/dev/null
+            kill -TERM "$pid" 2>/dev/null || true
             log "INFO" "Daemon stopped."
         fi
         rm -f "$DAEMON_PIDFILE"
     fi
     stop_refresh_mode
     stop_random_mode
+    return 0
 }
 
 # ----------------------------------------------------------------------
-# Preview, list, diagnose, systemd, completions (unchanged)
+# Preview, list, diagnose (split into smaller functions)
 # ----------------------------------------------------------------------
-preview_wallpaper() {
-    local image="$1" mode="${2:-${CONFIG[mode]}}"
-    [[ -f "$image" ]] || { log "ERROR" "File not found: $image"; return 1; }
-    get_total_span
-    local scale="800"
-    if [[ $TOTAL_WIDTH -gt $TOTAL_HEIGHT ]]; then
-        scale_w=$scale
-        scale_h=$((TOTAL_HEIGHT * scale / TOTAL_WIDTH))
-    else
-        scale_h=$scale
-        scale_w=$((TOTAL_WIDTH * scale / TOTAL_HEIGHT))
-    fi
-    local temp_file
-    temp_file="$(mktemp --suffix=.jpg)"
-    $IM_CMD "$image" -resize "${scale_w}x${scale_h}" "$temp_file"
-    echo "Preview saved to $temp_file"
-    if command -v display &>/dev/null; then
-        display "$temp_file"
-    else
-        xdg-open "$temp_file" 2>/dev/null || log "INFO" "Open $temp_file with your image viewer."
-    fi
-}
-
-list_images() {
-    local dir="$1"
-    [[ -d "$dir" ]] || { log "ERROR" "Directory not found: $dir"; return 1; }
-    printf "%-40s %8s %8s\n" "Filename" "Width" "Height"
-    find "$dir" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.webp" \) -print0 | while IFS= read -r -d '' file; do
-        local w h
-        w="$($IM_IDENTIFY -format "%w" "$file" 2>/dev/null)" || w="?"
-        h="$($IM_IDENTIFY -format "%h" "$file" 2>/dev/null)" || h="?"
-        printf "%-40s %8s %8s\n" "$(basename "$file")" "$w" "$h"
-    done
-}
-
-diagnose() {
-    echo "=== Ultraspan Diagnose ==="
-    echo "Version: $VERSION"
-    echo "Bash: $BASH_VERSION"
-    echo "ImageMagick: $($IM_CMD -version | head -1)"
+_diagnose_dependencies() {
     echo "Dependencies:"
     for cmd in xrandr gsettings md5sum bc feh nitrogen; do
         if command -v "$cmd" &>/dev/null; then
@@ -1030,16 +1209,26 @@ diagnose() {
             echo "  ❌ $cmd (optional)"
         fi
     done
+}
+
+_diagnose_config() {
     echo "Config:"
     for k in "${!CONFIG[@]}"; do
         echo "  $k = ${CONFIG[$k]}"
     done
+}
+
+_diagnose_monitors() {
     echo "Monitor layout:"
-    get_monitor_info
+    get_monitor_info || return 1
     echo "  Count: $MONITOR_COUNT"
     for i in $(seq 0 $((MONITOR_COUNT-1))); do
         echo "  ${MONITOR_NAMES[i]}: ${MONITOR_W[i]}x${MONITOR_H[i]} at ${MONITOR_X[i]},${MONITOR_Y[i]}"
     done
+    return 0
+}
+
+_diagnose_services() {
     echo "Cache: $(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)"
     echo "State file: $(head -n1 "$STATE_FILE" 2>/dev/null)"
     if [[ -f "$REFRESH_FILE" ]]; then
@@ -1059,6 +1248,61 @@ diagnose() {
     fi
 }
 
+diagnose() {
+    echo "=== Ultraspan Diagnose ==="
+    echo "Version: $VERSION"
+    echo "Bash: $BASH_VERSION"
+    echo "ImageMagick: $($IM_CMD -version | head -1)"
+    _diagnose_dependencies
+    _diagnose_config
+    _diagnose_monitors || return 1
+    _diagnose_services
+    return 0
+}
+
+preview_wallpaper() {
+    local image="$1" mode="${2:-${CONFIG[mode]}}"
+    local scale="800" scale_w scale_h temp_file
+
+    assert_file_exists "$image" || return 1
+    get_total_span || return 1
+
+    if [[ $TOTAL_WIDTH -gt $TOTAL_HEIGHT ]]; then
+        scale_w=$scale
+        scale_h=$((TOTAL_HEIGHT * scale / TOTAL_WIDTH))
+    else
+        scale_h=$scale
+        scale_w=$((TOTAL_WIDTH * scale / TOTAL_HEIGHT))
+    fi
+
+    temp_file="$(mktemp --suffix=.jpg)"
+    $IM_CMD "$image" -resize "${scale_w}x${scale_h}" "$temp_file"
+    echo "Preview saved to $temp_file"
+    if command -v display &>/dev/null; then
+        display "$temp_file"
+    else
+        xdg-open "$temp_file" 2>/dev/null || log "INFO" "Open $temp_file with your image viewer."
+    fi
+    return 0
+}
+
+list_images() {
+    local dir="$1"
+    assert_dir_exists "$dir" || return 1
+
+    printf "%-40s %8s %8s\n" "Filename" "Width" "Height"
+    find "$dir" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.webp" \) -print0 | while IFS= read -r -d '' file; do
+        local w h
+        w="$($IM_IDENTIFY -format "%w" "$file" 2>/dev/null)" || w="?"
+        h="$($IM_IDENTIFY -format "%h" "$file" 2>/dev/null)" || h="?"
+        printf "%-40s %8s %8s\n" "$(basename "$file")" "$w" "$h"
+    done
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Systemd and completion generators
+# ----------------------------------------------------------------------
 generate_systemd() {
     cat <<EOF
 [Unit]
@@ -1162,62 +1406,266 @@ EOF
 }
 
 # ----------------------------------------------------------------------
+# Command handlers (split from main)
+# ----------------------------------------------------------------------
+_handle_set() {
+    local workspace=""
+    if [[ "$1" == "--workspace" ]]; then
+        workspace="$2"; shift 2
+    fi
+    [[ -z "$1" ]] && { log "ERROR" "Usage: set [--workspace N] IMAGE [MODE] [force]"; return 1; }
+    local mode="${2:-${CONFIG[mode]}}"
+    local force="${3:-false}"
+    if [[ -n "$workspace" ]]; then
+        STATE_FILE="$(get_state_file "$workspace")"
+    fi
+    set_wallpaper "$1" "$mode" "$force"
+    return $?
+}
+
+_handle_set_per_monitor() {
+    local workspace=""
+    if [[ "$1" == "--workspace" ]]; then
+        workspace="$2"; shift 2
+    fi
+    [[ $# -eq 0 ]] && { log "ERROR" "Usage: set-per-monitor [--workspace N] IMG1 IMG2 ... [MODE]"; return 1; }
+    if [[ -n "$workspace" ]]; then
+        STATE_FILE="$(get_state_file "$workspace")"
+    fi
+    set_per_monitor_wallpaper "$@"
+    return $?
+}
+
+_handle_random() {
+    [[ -z "$1" ]] && { log "ERROR" "Usage: random DIR [MODE]"; return 1; }
+    stop_random_mode
+    start_random_mode "$1" "$2"
+    return $?
+}
+
+_handle_random_multi() {
+    [[ -z "$1" ]] && { log "ERROR" "Usage: random-multi DIR [MODE]"; return 1; }
+    stop_random_mode
+    start_random_multi_mode "$1" "$2"
+    return $?
+}
+
+_handle_interval() {
+    if [[ -z "$1" ]]; then
+        echo "Interval: ${CONFIG[random_interval]} min"
+        return 0
+    fi
+    [[ "$1" =~ ^[0-9]+$ ]] || { log "ERROR" "Invalid interval"; return 1; }
+    update_config random_interval "$1" || return 1
+    if [[ -f "$RANDOM_FILE" ]]; then
+        local dir mode
+        while IFS='=' read -r key value; do
+            case "$key" in directory) dir="$value" ;; mode) mode="$value" ;; esac
+        done < "$RANDOM_FILE"
+        stop_random_mode
+        [[ -n "$dir" ]] && start_random_mode "$dir" "$mode"
+    fi
+    return 0
+}
+
+_handle_refresh_start() {
+    local interval="${1:-${CONFIG[refresh_interval]}}"
+    start_refresh_mode "$interval"
+    return $?
+}
+
+_handle_refresh_status() {
+    if [[ -f "$REFRESH_FILE" ]]; then
+        echo "Refresh interval: $(head -n1 "$REFRESH_FILE" | cut -d= -f2) min"
+        echo "Active PIDs: $(tail -n +2 "$REFRESH_FILE")"
+    else
+        echo "Refresh not active."
+    fi
+    return 0
+}
+
+_handle_status() {
+    echo "=== Ultraspan Status ==="
+    echo "Version: $VERSION"
+    if [[ "${CONFIG[backend]}" == "gsettings" ]]; then
+        local current_uri
+        current_uri="$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null | sed "s/'//g")"
+        echo "Current wallpaper: $current_uri"
+    else
+        echo "Current wallpaper: (not using gsettings backend)"
+    fi
+    get_total_span || return 1
+    echo "Span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
+    echo "Mode: ${CONFIG[mode]}, Background: ${CONFIG[bg_type]}"
+    [[ "${CONFIG[bg_type]}" == "blur" ]] && echo "Blur: ${CONFIG[blur]}" || echo "Color: ${CONFIG[color]}"
+    echo "Backend: ${CONFIG[backend]}"
+    echo "Cache limit: ${CONFIG[max_cache_mb]} MB"
+    [[ -f "$RANDOM_FILE" ]] && echo "Random: active" || echo "Random: inactive"
+    [[ -f "$REFRESH_FILE" ]] && echo "Refresh: active" || echo "Refresh: inactive"
+    return 0
+}
+
+_handle_info() {
+    [[ -z "$1" ]] && { log "ERROR" "Usage: info IMAGE"; return 1; }
+    echo "File: $1"
+    echo "Size: $(du -h "$1" | cut -f1)"
+    local w h
+    w="$($IM_IDENTIFY -format "%w" "$1" 2>/dev/null)" || w="?"
+    h="$($IM_IDENTIFY -format "%h" "$1" 2>/dev/null)" || h="?"
+    echo "Dimensions: ${w}x${h}"
+    return 0
+}
+
+_handle_daemon() {
+    local daemon_mode="background"
+    if [[ "$1" == "--foreground" ]]; then
+        daemon_mode="foreground"
+    elif [[ "$1" == "--oneshot" ]]; then
+        daemon_mode="oneshot"
+    fi
+    start_daemon "$daemon_mode"
+    return $?
+}
+
+_handle_mode() {
+    if [[ -z "$1" ]]; then
+        echo "Mode: ${CONFIG[mode]}"
+        return 0
+    fi
+    case "$1" in zoom|fit|center) ;; *) log "ERROR" "Invalid mode"; return 1 ;; esac
+    update_config mode "$1" || return 1
+    if [[ -f "$STATE_FILE" ]]; then
+        local recent_image
+        recent_image="$(head -n1 "$STATE_FILE")"
+        [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$1"
+    fi
+    return 0
+}
+
+_handle_bg_type() {
+    if [[ -z "$1" ]]; then
+        echo "Background type: ${CONFIG[bg_type]}"
+        return 0
+    fi
+    case "$1" in blur|solid) ;; *) log "ERROR" "Invalid bg-type"; return 1 ;; esac
+    update_config bg_type "$1" || return 1
+    if [[ -f "$STATE_FILE" ]]; then
+        local recent_image mode
+        recent_image="$(head -n1 "$STATE_FILE")"
+        mode="$(sed -n '2p' "$STATE_FILE" | head -n1)"
+        [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$mode"
+    fi
+    return 0
+}
+
+_handle_blur() {
+    if [[ -z "$1" ]]; then
+        echo "Blur: ${CONFIG[blur]}"
+        return 0
+    fi
+    if ! [[ "$1" =~ ^[0-9]+$ ]] || ! [[ "$1" -ge 0 ]] || ! [[ "$1" -le 100 ]]; then
+        log "ERROR" "Blur must be 0-100"
+        return 1
+    fi
+    update_config blur "$1" || return 1
+    if [[ -f "$STATE_FILE" ]] && [[ "${CONFIG[bg_type]}" == "blur" ]]; then
+        local recent_image mode
+        recent_image="$(head -n1 "$STATE_FILE")"
+        mode="$(sed -n '2p' "$STATE_FILE" | head -n1)"
+        [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$mode"
+    fi
+    return 0
+}
+
+_handle_color() {
+    if [[ -z "$1" ]]; then
+        echo "Color: ${CONFIG[color]}"
+        return 0
+    fi
+    local color="$1"
+    color="${color#\#}"
+    [[ "$color" =~ ^[0-9A-Fa-f]{6}$ ]] || { log "ERROR" "Invalid hex color"; return 1; }
+    color="#$color"
+    update_config color "$color" || return 1
+    if [[ -f "$STATE_FILE" ]] && [[ "${CONFIG[bg_type]}" == "solid" ]]; then
+        refresh_wallpaper
+    fi
+    return 0
+}
+
+_handle_fullscreen() {
+    if [[ -z "$1" ]]; then
+        echo "Fullscreen pause: ${CONFIG[fullscreen_pause]}"
+        return 0
+    fi
+    local val
+    case "$1" in on|true|1) val="true" ;; off|false|0) val="false" ;; *) log "ERROR" "Invalid value"; return 1 ;; esac
+    update_config fullscreen_pause "$val" || return 1
+    if [[ -f "$REFRESH_FILE" ]]; then
+        local interval
+        interval="$(head -n1 "$REFRESH_FILE" | cut -d= -f2)"
+        stop_refresh_mode
+        start_refresh_mode "$interval"
+    fi
+    return 0
+}
+
+_handle_backend() {
+    if [[ -z "$1" ]]; then
+        echo "Backend: ${CONFIG[backend]}"
+        return 0
+    fi
+    case "$1" in gsettings|feh|nitrogen) ;; *) log "ERROR" "Invalid backend"; return 1 ;; esac
+    update_config backend "$1" || return 1
+    [[ -f "$STATE_FILE" ]] && refresh_wallpaper
+    return 0
+}
+
+_handle_restore() {
+    local default_wp="/usr/share/backgrounds/linuxmint/default_background.jpg"
+    if [[ -f "$default_wp" ]]; then
+        set_wallpaper "$default_wp" "zoom"
+    else
+        local alt
+        alt="$(find /usr/share/backgrounds /usr/share/wallpapers -name "*.jpg" -o -name "*.png" | head -1)"
+        if [[ -n "$alt" ]]; then
+            set_wallpaper "$alt" "zoom"
+        else
+            log "ERROR" "No system wallpaper found"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------------
 # Main dispatcher
 # ----------------------------------------------------------------------
 main() {
+    # Ensure required directories exist
     mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$PID_DIR"
+
     load_config
     if [[ "${CONFIG[per_workspace]}" == "true" ]]; then
         STATE_FILE="$(get_state_file)"
     fi
-    # Apply ImageMagick memory limit from config
     export MAGICK_MEMORY_LIMIT="${CONFIG[magick_memory]}"
 
-    acquire_lock
+    acquire_lock || return 1
 
     local cmd="${1:-help}"
     shift || true
 
-    # Ensure positional parameters are always defined under set -u
     if (( $# == 0 )); then
         set -- ""
     fi
 
+    local ret=0
     case "$cmd" in
-        set)
-            local workspace=""
-            if [[ "$1" == "--workspace" ]]; then
-                workspace="$2"; shift 2
-            fi
-            [[ -z "$1" ]] && { log "ERROR" "Usage: set [--workspace N] IMAGE [MODE] [force]"; exit 1; }
-            local mode="${2:-${CONFIG[mode]}}"
-            local force="${3:-false}"
-            if [[ -n "$workspace" ]]; then
-                STATE_FILE="$(get_state_file "$workspace")"
-            fi
-            set_wallpaper "$1" "$mode" "$force"
-            ;;
-        set-per-monitor)
-            local workspace=""
-            if [[ "$1" == "--workspace" ]]; then
-                workspace="$2"; shift 2
-            fi
-            [[ $# -eq 0 ]] && { log "ERROR" "Usage: set-per-monitor [--workspace N] IMG1 IMG2 ... [MODE]"; exit 1; }
-            if [[ -n "$workspace" ]]; then
-                STATE_FILE="$(get_state_file "$workspace")"
-            fi
-            set_per_monitor_wallpaper "$@"
-            ;;
-        random)
-            [[ -z "$1" ]] && { log "ERROR" "Usage: random DIR [MODE]"; exit 1; }
-            stop_random_mode
-            start_random_mode "$1" "$2"
-            ;;
-        random-multi)
-            [[ -z "$1" ]] && { log "ERROR" "Usage: random-multi DIR [MODE]"; exit 1; }
-            stop_random_mode
-            start_random_multi_mode "$1" "$2"
-            ;;
+        set) _handle_set "$@" ;;
+        set-per-monitor) _handle_set_per_monitor "$@" ;;
+        random) _handle_random "$@" ;;
+        random-multi) _handle_random_multi "$@" ;;
         random-stop) stop_random_mode ;;
         random-status)
             if [[ -f "$RANDOM_FILE" ]]; then
@@ -1226,211 +1674,48 @@ main() {
                 echo "Random rotation not active."
             fi
             ;;
-        interval)
-            if [[ -z "$1" ]]; then
-                echo "Interval: ${CONFIG[random_interval]} min"
-            else
-                [[ "$1" =~ ^[0-9]+$ ]] || { log "ERROR" "Invalid interval"; exit 1; }
-                update_config random_interval "$1"
-                if [[ -f "$RANDOM_FILE" ]]; then
-                    local dir mode
-                    while IFS='=' read -r key value; do
-                        case "$key" in directory) dir="$value" ;; mode) mode="$value" ;; esac
-                    done < "$RANDOM_FILE"
-                    stop_random_mode
-                    [[ -n "$dir" ]] && start_random_mode "$dir" "$mode"
-                fi
-            fi
-            ;;
-        refresh-start)
-            local interval="${1:-${CONFIG[refresh_interval]}}"
-            start_refresh_mode "$interval"
-            ;;
+        interval) _handle_interval "$@" ;;
+        refresh-start) _handle_refresh_start "$@" ;;
         refresh-stop) stop_refresh_mode ;;
-        refresh-status)
-            if [[ -f "$REFRESH_FILE" ]]; then
-                echo "Refresh interval: $(head -n1 "$REFRESH_FILE" | cut -d= -f2) min"
-                echo "Active PIDs: $(tail -n +2 "$REFRESH_FILE")"
-            else
-                echo "Refresh not active."
-            fi
-            ;;
+        refresh-status) _handle_refresh_status ;;
         refresh-wallpaper) refresh_wallpaper ;;
-        status)
-            echo "=== Ultraspan Status ==="
-            echo "Version: $VERSION"
-            if [[ "${CONFIG[backend]}" == "gsettings" ]]; then
-                local current_uri
-                current_uri="$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null | sed "s/'//g")"
-                echo "Current wallpaper: $current_uri"
-            else
-                echo "Current wallpaper: (not using gsettings backend)"
-            fi
-            get_total_span
-            echo "Span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
-            echo "Mode: ${CONFIG[mode]}, Background: ${CONFIG[bg_type]}"
-            [[ "${CONFIG[bg_type]}" == "blur" ]] && echo "Blur: ${CONFIG[blur]}" || echo "Color: ${CONFIG[color]}"
-            echo "Backend: ${CONFIG[backend]}"
-            echo "Cache limit: ${CONFIG[max_cache_mb]} MB"
-            [[ -f "$RANDOM_FILE" ]] && echo "Random: active" || echo "Random: inactive"
-            [[ -f "$REFRESH_FILE" ]] && echo "Refresh: active" || echo "Refresh: inactive"
-            ;;
-        info)
-            [[ -z "$1" ]] && { log "ERROR" "Usage: info IMAGE"; exit 1; }
-            echo "File: $1"
-            echo "Size: $(du -h "$1" | cut -f1)"
-            local w h
-            w="$($IM_IDENTIFY -format "%w" "$1" 2>/dev/null)" || w="?"
-            h="$($IM_IDENTIFY -format "%h" "$1" 2>/dev/null)" || h="?"
-            echo "Dimensions: ${w}x${h}"
-            ;;
-        preview)
-            [[ -z "$1" ]] && { log "ERROR" "Usage: preview IMAGE [MODE]"; exit 1; }
-            preview_wallpaper "$1" "$2"
-            ;;
-        list-images)
-            [[ -z "$1" ]] && { log "ERROR" "Usage: list-images DIR"; exit 1; }
-            list_images "$1"
-            ;;
+        status) _handle_status ;;
+        info) _handle_info "$@" ;;
+        preview) [[ -z "$1" ]] && { log "ERROR" "Usage: preview IMAGE [MODE]"; ret=1; } || preview_wallpaper "$1" "$2";;
+        list-images) [[ -z "$1" ]] && { log "ERROR" "Usage: list-images DIR"; ret=1; } || list_images "$1" ;;
         diagnose) diagnose ;;
-        daemon)
-            # Accept optional mode flag
-            local daemon_mode="background"
-            if [[ "$1" == "--foreground" ]]; then
-                daemon_mode="foreground"
-            elif [[ "$1" == "--oneshot" ]]; then
-                daemon_mode="oneshot"
-            fi
-            start_daemon "$daemon_mode"
-            # start_daemon exits for background/oneshot, but foreground loops forever
-            ;;
-        daemon-stop)
-            stop_daemon
-            ;;
-        data-wipe)
-            data_wipe_ultraspan
-            ;;
+        daemon) _handle_daemon "$@" ;;
+        daemon-stop) stop_daemon ;;
+        data-wipe) data_wipe_ultraspan ;;
         set-config)
-            [[ -z "$1" ]] || [[ -z "$2" ]] && { log "ERROR" "Usage: set-config KEY VALUE"; exit 1; }
-            update_config "$1" "$2"
+            [[ -z "$1" ]] || [[ -z "$2" ]] && { log "ERROR" "Usage: set-config KEY VALUE"; ret=1; } || update_config "$1" "$2"
             ;;
-        mode)
-            if [[ -z "$1" ]]; then
-                echo "Mode: ${CONFIG[mode]}"
-            else
-                case "$1" in zoom|fit|center) ;; *) log "ERROR" "Invalid mode"; exit 1 ;; esac
-                update_config mode "$1"
-                if [[ -f "$STATE_FILE" ]]; then
-                    local recent_image
-                    recent_image="$(head -n1 "$STATE_FILE")"
-                    [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$1"
-                fi
-            fi
-            ;;
-        bg-type)
-            if [[ -z "$1" ]]; then
-                echo "Background type: ${CONFIG[bg_type]}"
-            else
-                case "$1" in blur|solid) ;; *) log "ERROR" "Invalid bg-type"; exit 1 ;; esac
-                update_config bg_type "$1"
-                if [[ -f "$STATE_FILE" ]]; then
-                    local recent_image mode
-                    recent_image="$(head -n1 "$STATE_FILE")"
-                    mode="$(sed -n '2p' "$STATE_FILE" | head -n1)"
-                    [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$mode"
-                fi
-            fi
-            ;;
-        blur)
-            if [[ -z "$1" ]]; then
-                echo "Blur: ${CONFIG[blur]}"
-            else
-                if ! [[ "$1" =~ ^[0-9]+$ ]] || ! [[ "$1" -ge 0 ]] || ! [[ "$1" -le 100 ]]; then
-                    log "ERROR" "Blur must be 0-100"
-                    exit 1
-                fi
-                update_config blur "$1"
-                if [[ -f "$STATE_FILE" ]] && [[ "${CONFIG[bg_type]}" == "blur" ]]; then
-                    local recent_image mode
-                    recent_image="$(head -n1 "$STATE_FILE")"
-                    mode="$(sed -n '2p' "$STATE_FILE" | head -n1)"
-                    [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$mode"
-                fi
-            fi
-            ;;
-        color)
-            if [[ -z "$1" ]]; then
-                echo "Color: ${CONFIG[color]}"
-            else
-                local color="$1"
-                color="${color#\#}"
-                [[ "$color" =~ ^[0-9A-Fa-f]{6}$ ]] || { log "ERROR" "Invalid hex color"; exit 1; }
-                color="#$color"
-                update_config color "$color"
-                if [[ -f "$STATE_FILE" ]] && [[ "${CONFIG[bg_type]}" == "solid" ]]; then
-                    refresh_wallpaper
-                fi
-            fi
-            ;;
-        fullscreen)
-            if [[ -z "$1" ]]; then
-                echo "Fullscreen pause: ${CONFIG[fullscreen_pause]}"
-            else
-                case "$1" in on|true|1) val="true" ;; off|false|0) val="false" ;; *) log "ERROR" "Invalid value"; exit 1 ;; esac
-                update_config fullscreen_pause "$val"
-                if [[ -f "$REFRESH_FILE" ]]; then
-                    local interval
-                    interval="$(head -n1 "$REFRESH_FILE" | cut -d= -f2)"
-                    stop_refresh_mode
-                    start_refresh_mode "$interval"
-                fi
-            fi
-            ;;
-        backend)
-            if [[ -z "$1" ]]; then
-                echo "Backend: ${CONFIG[backend]}"
-            else
-                case "$1" in gsettings|feh|nitrogen) ;; *) log "ERROR" "Invalid backend"; exit 1 ;; esac
-                update_config backend "$1"
-                [[ -f "$STATE_FILE" ]] && refresh_wallpaper
-            fi
-            ;;
+        mode) _handle_mode "$@" ;;
+        bg-type) _handle_bg_type "$@" ;;
+        blur) _handle_blur "$@" ;;
+        color) _handle_color "$@" ;;
+        fullscreen) _handle_fullscreen "$@" ;;
+        backend) _handle_backend "$@" ;;
         clean)
             log "INFO" "Cleaning cache..."
             rm -rf "$CACHE_DIR"
             mkdir -p "$CACHE_DIR"
             echo "Cache cleared."
             ;;
-        restore)
-            local default_wp="/usr/share/backgrounds/linuxmint/default_background.jpg"
-            if [[ -f "$default_wp" ]]; then
-                set_wallpaper "$default_wp" "zoom"
-            else
-                local alt
-                alt="$(find /usr/share/backgrounds /usr/share/wallpapers -name "*.jpg" -o -name "*.png" | head -1)"
-                if [[ -n "$alt" ]]; then
-                    set_wallpaper "$alt" "zoom"
-                else
-                    log "ERROR" "No system wallpaper found"
-                fi
-            fi
-            ;;
-        generate-systemd)
-            generate_systemd
-            ;;
-        generate-completion)
-            generate_completion
-            ;;
+        restore) _handle_restore ;;
+        generate-systemd) generate_systemd ;;
+        generate-completion) generate_completion ;;
         help|--help|-h) show_help ;;
         --version) echo "Ultraspan version $VERSION" ;;
         *)
             log "ERROR" "Unknown command: $cmd"
             show_help
-            exit 1
+            ret=1
             ;;
     esac
 
     release_lock
+    return $ret
 }
 
 # ----------------------------------------------------------------------
