@@ -4,7 +4,7 @@ set -u
 # ============================================
 # Ultraspan - Ultimate Multi‑Monitor Wallpaper Utility
 # ============================================
-# Version 5.4.1 - Refactoring and code-guideline improvements
+# Version 5.4.1 - Refacotring and code-guidline improvments
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -1681,14 +1681,33 @@ main() {
         refresh-wallpaper) refresh_wallpaper ;;
         status) _handle_status ;;
         info) _handle_info "$@" ;;
-        preview) [[ -z "$1" ]] && { log "ERROR" "Usage: preview IMAGE [MODE]"; ret=1; } || preview_wallpaper "$1" "$2";;
-        list-images) [[ -z "$1" ]] && { log "ERROR" "Usage: list-images DIR"; ret=1; } || list_images "$1" ;;
+        preview)
+            if [[ -z "$1" ]]; then
+                log "ERROR" "Usage: preview IMAGE [MODE]"
+                ret=1
+            else
+                preview_wallpaper "$1" "$2"
+            fi
+            ;;
+        list-images)
+            if [[ -z "$1" ]]; then
+                log "ERROR" "Usage: list-images DIR"
+                ret=1
+            else
+                list_images "$1"
+            fi
+            ;;
         diagnose) diagnose ;;
         daemon) _handle_daemon "$@" ;;
         daemon-stop) stop_daemon ;;
         data-wipe) data_wipe_ultraspan ;;
         set-config)
-            [[ -z "$1" ]] || [[ -z "$2" ]] && { log "ERROR" "Usage: set-config KEY VALUE"; ret=1; } || update_config "$1" "$2"
+            if [[ -z "$1" || -z "$2" ]]; then
+                log "ERROR" "Usage: set-config KEY VALUE"
+                ret=1
+            else
+                update_config "$1" "$2"
+            fi
             ;;
         mode) _handle_mode "$@" ;;
         bg-type) _handle_bg_type "$@" ;;
