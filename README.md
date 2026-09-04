@@ -144,13 +144,15 @@ This will run the refresh command at launch and reapply current wallpaper every 
 
 #### Setting separate workspace wallpapers
 
+Note - per-workspace feature currently uses xdotool which user will need to download separately
+
 1. Set per_workspace=true in config
 
 2. Start daemon (stop and restart daemon)
 
 3. Move to specific workspace to set wallpapers or use --workspace in set command and 0-3 for workspace number
 
-#### Installing graphical user interface
+#### Installing gui (graphical user interface)
 
 dependencies needed for Debian/Ubuntu/Mint:
 ```
