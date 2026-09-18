@@ -188,12 +188,23 @@ def build_media_pixbuf(gtk, path: str):
     thumb_path = get_thumbnail_path(path, size=134)
     pixbuf = None
 
+    # 1. Try the cache
     if os.path.exists(thumb_path):
         try:
             pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
         except gtk['GLib'].Error:
             pixbuf = None
 
+    # 2. Generate fresh
+    if pixbuf is None:
+        if is_video_path(path):
+            if generate_video_thumbnail(path, thumb_path, size=134):
+                try:
+                    pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
+                except gtk['GLib'].Error:
+                    pixbuf = None
+            else:
+                print(f"[thumb] ffmpeg failed: {path}", file=sys.stderr)
         else:
             try:
                 pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file_at_scale(path, 134, 134, True)
@@ -205,7 +216,9 @@ def build_media_pixbuf(gtk, path: str):
                 print(f"[thumb] decode failed: {path}: {type(e).__name__}: {e}", file=sys.stderr)
                 pixbuf = None
 
+    # 3. Placeholder so nothing disappears
     if pixbuf is None:
+        print(f"[thumb] using placeholder: {path}", file=sys.stderr)
         pixbuf = gtk['GdkPixbuf'].Pixbuf.new(
             gtk['GdkPixbuf'].Colorspace.RGB, False, 8, 134, 134
         )
