@@ -2,13 +2,13 @@
 set -u
 
 # ============================================
-# Ultraspan - Ultimate Multi‑Monitor Wallpaper Utility
+# Ultraspan - Ultimate Multi-Monitor Wallpaper Utility
 # ============================================
-# Version 5.4.1 - Refacotring and code-guidline improvments
+# Version 6.0.0
 # ============================================
 
 # ----------------------------------------------------------------------
-# Configuration (can be overridden in ~/.config/ultraspan/config)
+# Configuration
 # ----------------------------------------------------------------------
 declare -A CONFIG
 CONFIG[mode]="zoom"
@@ -24,8 +24,12 @@ CONFIG[max_cache_mb]=2000
 CONFIG[magick_memory]="2GiB"
 CONFIG[config_version]=1
 CONFIG[per_workspace]="false"
+CONFIG[video_daemon]=""   # resolved at runtime by _find_video_daemon
+CONFIG[video_slice_fps]=30
+CONFIG[video_slice_crf]=18
+CONFIG[fullscreen_grace_seconds]=5
 
-VERSION="5.4.1"
+VERSION="6.0.0"
 CONFIG_DIR="${HOME}/.config/ultraspan"
 CONFIG_FILE="${CONFIG_DIR}/config"
 CACHE_DIR="${HOME}/.cache/ultraspan"
@@ -38,10 +42,50 @@ LAYOUT_MONITOR_PIDFILE="${CONFIG_DIR}/layout_monitor.pid"
 LOG_FILE="${CACHE_DIR}/ultraspan.log"
 PID_DIR="/run/user/${UID}/ultraspan"
 DAEMON_PIDFILE="${PID_DIR}/daemon.pid"
+VIDEO_PID_FILE="${CONFIG_DIR}/video.pid"
 
 DEBUG=false
 VERBOSE=false
 WATCHDOG_LIMIT=1000000
+
+# Locate the lightning-bug daemon. Search order:
+#   1. $ULTRASPAN_DAEMON env var (explicit override)
+#   2. Next to this script (side-by-side install)
+#   3. $HOME/.local/bin/lightning-bug (user install)
+#   4. /usr/local/bin/lightning-bug (local system install)
+#   5. /usr/bin/lightning-bug (distro install)
+#   6. PATH lookup
+_find_video_daemon() {
+    if [[ -n "${ULTRASPAN_DAEMON:-}" && -x "$ULTRASPAN_DAEMON" ]]; then
+        echo "$ULTRASPAN_DAEMON"
+        return 0
+    fi
+
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    local candidates=(
+        "${script_dir}/lightning-bug"
+        "${HOME}/.local/bin/lightning-bug"
+        "/usr/local/bin/lightning-bug"
+        "/usr/bin/lightning-bug"
+    )
+    for c in "${candidates[@]}"; do
+        if [[ -x "$c" ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+
+    local from_path
+    from_path="$(command -v lightning-bug 2>/dev/null)"
+    if [[ -n "$from_path" ]]; then
+        echo "$from_path"
+        return 0
+    fi
+
+    return 1
+}
 
 # ----------------------------------------------------------------------
 # Assertion helpers
@@ -76,7 +120,7 @@ assert_positive_int() {
 assert_non_negative_int() {
     local val="$1"
     if [[ ! "$val" =~ ^[0-9]+$ ]]; then
-        log "ERROR" "Assertion failed: Not a non‑negative integer: $val"
+        log "ERROR" "Assertion failed: Not a non-negative integer: $val"
         return 1
     fi
     return 0
@@ -92,7 +136,7 @@ assert_command_available() {
 }
 
 # ----------------------------------------------------------------------
-# ImageMagick detection & memory limit
+# ImageMagick detection
 # ----------------------------------------------------------------------
 if command -v magick &>/dev/null; then
     IM_CMD="magick"
@@ -112,8 +156,8 @@ log() {
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
     if [[ "$level" == "ERROR" ]]; then
         printf "[%s] %s: %s\n" "$timestamp" "$level" "$msg" >&2
-    elif [[ "$DEBUG" == "true" ]] || [[ "$level" == "INFO" ]]; then
-        printf "[%s] %s: %s\n" "$timestamp" "$level" "$msg" >> "$LOG_FILE"
+    elif [[ "$DEBUG" == "true" ]] || [[ "$level" == "INFO" ]] || [[ "$level" == "WARN" ]]; then
+        printf ... >> "$LOG_FILE"
     fi
     if [[ "$VERBOSE" == "true" ]] && [[ "$level" != "ERROR" ]]; then
         printf "[%s] %s\n" "$timestamp" "$msg"
@@ -122,7 +166,7 @@ log() {
 
 debug_log() {
     [[ "$DEBUG" == "true" ]] && log "DEBUG" "$@"
-    return 0   # always return 0 to avoid propagating [[ ]] return status
+    return 0
 }
 
 # ----------------------------------------------------------------------
@@ -144,7 +188,7 @@ url_encode() {
 }
 
 # ----------------------------------------------------------------------
-# Locking - blocking wait, stale detection
+# Locking
 # ----------------------------------------------------------------------
 acquire_lock() {
     if [[ -f "$LOCK_FILE" ]]; then
@@ -179,7 +223,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ----------------------------------------------------------------------
-# Config helpers (with migration)
+# Config helpers
 # ----------------------------------------------------------------------
 migrate_config() {
     local current_version="${CONFIG[config_version]:-0}"
@@ -217,6 +261,22 @@ load_config() {
     : "${CONFIG[magick_memory]:=2GiB}"
     : "${CONFIG[per_workspace]:=false}"
     : "${CONFIG[config_version]:=1}"
+    : "${CONFIG[video_slice_fps]:=30}"
+    : "${CONFIG[video_slice_crf]:=18}"
+    : "${CONFIG[fullscreen_grace_seconds]:=5}"
+
+    # Resolve daemon path if not set by config file or earlier.
+    if [[ -z "${CONFIG[video_daemon]}" ]]; then
+        local resolved
+        if resolved="$(_find_video_daemon)"; then
+            CONFIG[video_daemon]="$resolved"
+        else
+            log "WARN" "lightning-bug daemon not found. Video wallpaper commands will fail."
+            log "WARN" "Searched: script dir, ~/.local/bin, /usr/local/bin, /usr/bin, PATH"
+            log "WARN" "Set ULTRASPAN_DAEMON=/path/to/lightning-bug to override."
+        fi
+    fi
+
     migrate_config
 }
 
@@ -251,7 +311,7 @@ trim_cache() {
 }
 
 # ----------------------------------------------------------------------
-# Monitor geometry (with sanity check)
+# Monitor geometry
 # ----------------------------------------------------------------------
 get_monitor_info() {
     unset MONITOR_NAMES MONITOR_X MONITOR_Y MONITOR_W MONITOR_H
@@ -306,17 +366,40 @@ get_total_span() {
 }
 
 # ----------------------------------------------------------------------
-# Filename safety: replace pipe character
+# Filename safety
 # ----------------------------------------------------------------------
 safe_filename() {
     printf '%s\n' "${1//|/%PIPE%}"
 }
 
 # ----------------------------------------------------------------------
-# Image processing helpers
+# Image/video helpers
 # ----------------------------------------------------------------------
 get_file_mtime() {
     stat -c %Y "$1" 2>/dev/null || echo "0"
+}
+
+_get_video_fps() {
+    local file="$1"
+    local raw
+    raw="$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=r_frame_rate \
+        -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)"
+    if [[ -z "$raw" || "$raw" == "0/0" ]]; then
+        echo 0
+        return 0
+    fi
+    local num den
+    if [[ "$raw" == */* ]]; then
+        num="${raw%/*}"; den="${raw#*/}"
+    else
+        num="$raw"; den=1
+    fi
+    if [[ ! "$num" =~ ^[0-9]+$ ]] || [[ ! "$den" =~ ^[0-9]+$ ]] || (( den == 0 )); then
+        echo 0
+        return 0
+    fi
+    echo $(( num / den ))
 }
 
 process_image_for_area() {
@@ -364,7 +447,7 @@ process_image_for_area() {
 }
 
 # ----------------------------------------------------------------------
-# Set wallpaper - split into smaller functions
+# Set wallpaper
 # ----------------------------------------------------------------------
 _build_wallpaper_cache() {
     local image="$1" mode="$2" force="$3"
@@ -485,7 +568,6 @@ _apply_wallpaper_backend() {
             nitrogen --set-scaled "$cache_file" 2>/dev/null || { log "WARN" "nitrogen failed"; return 1; }
             ;;
         *)
-            # gsettings: URL-encode the path
             local encoded_path
             encoded_path="$(url_encode "$cache_file")"
             local uri="file://$encoded_path"
@@ -523,7 +605,7 @@ set_wallpaper() {
 }
 
 # ----------------------------------------------------------------------
-# Per‑monitor wallpaper - split into smaller functions
+# Per-monitor wallpaper
 # ----------------------------------------------------------------------
 _create_background_canvas() {
     local first_image="$1"
@@ -684,7 +766,7 @@ set_per_monitor_wallpaper() {
         assert_file_exists "$img" || return 1
     done
 
-    log "INFO" "Setting per‑monitor wallpaper ($MONITOR_COUNT monitors)"
+    log "INFO" "Setting per-monitor wallpaper ($MONITOR_COUNT monitors)"
     get_total_span || return 1
     mkdir -p "$CACHE_DIR"
 
@@ -693,20 +775,416 @@ set_per_monitor_wallpaper() {
     trim_cache
 
     if [[ ! -f "$CACHE_FILE" ]]; then
-        log "INFO" "Processing per‑monitor images..."
+        log "INFO" "Processing per-monitor images..."
         _generate_per_monitor_wallpaper "$mode" "$CACHE_FILE" "${images[@]}" || return 1
     else
-        log "INFO" "Using cached per‑monitor image"
+        log "INFO" "Using cached per-monitor image"
     fi
 
     _save_per_monitor_state "$mode" "${images[@]}" || return 1
     _apply_per_monitor_backend "$CACHE_FILE" || return 1
-    log "INFO" "Per‑monitor wallpaper set."
+    log "INFO" "Per-monitor wallpaper set."
     return 0
 }
 
 # ----------------------------------------------------------------------
-# Refresh and helper functions
+# Video wallpaper (Rust daemon)
+# ----------------------------------------------------------------------
+set_video_wallpaper() {
+    local video_file="$1"
+    assert_file_exists "$video_file" || return 1
+
+    stop_video_wallpaper
+    _ensure_fullscreen_monitor
+
+    local daemon="${CONFIG[video_daemon]}"
+    assert_file_exists "$daemon" || { log "ERROR" "Video daemon not found: $daemon"; return 1; }
+
+    log "INFO" "Starting video daemon in split mode"
+    "$daemon" --split "$video_file" &
+    local pid=$!
+    disown
+
+    echo "$pid" > "$VIDEO_PID_FILE"
+    log "INFO" "Video wallpaper started (PID $pid)"
+    return 0
+}
+
+set_video_per_monitor_wallpaper() {
+    if [[ $# -eq 0 ]]; then
+        log "ERROR" "Usage: set-video-per-monitor VIDEO1 VIDEO2 ... VIDEO_N"
+        return 1
+    fi
+
+    local daemon="${CONFIG[video_daemon]}"
+    assert_file_exists "$daemon" || { log "ERROR" "Video daemon not found: $daemon"; return 1; }
+
+    local f
+    for f in "$@"; do
+        assert_file_exists "$f" || return 1
+    done
+
+    stop_video_wallpaper
+    _ensure_fullscreen_monitor
+
+    log "INFO" "Starting video daemon in per-monitor mode with $# video(s)"
+    "$daemon" --per-monitor "$@" &
+    local pid=$!
+    disown
+
+    echo "$pid" > "$VIDEO_PID_FILE"
+    log "INFO" "Per-monitor video wallpaper started (PID $pid)"
+    return 0
+}
+
+set_video_span_wallpaper() {
+    local video_file="$1"
+    assert_file_exists "$video_file" || return 1
+    get_monitor_info || return 1
+    get_total_span || return 1
+
+    stop_video_wallpaper
+    _ensure_fullscreen_monitor
+
+    assert_command_available ffmpeg || return 1
+    assert_command_available ffprobe || return 1
+
+    local abs_video
+    abs_video="$(readlink -f "$video_file")"
+    local mtime
+    mtime="$(get_file_mtime "$abs_video")"
+
+    local target_fps="${CONFIG[video_slice_fps]}"
+    local crf="${CONFIG[video_slice_crf]}"
+    if [[ ! "$target_fps" =~ ^[0-9]+$ ]] || (( target_fps <= 0 )); then
+        log "WARN" "Invalid video_slice_fps='${CONFIG[video_slice_fps]}', using 30"
+        target_fps=30
+    fi
+    if [[ ! "$crf" =~ ^[0-9]+$ ]] || (( crf < 0 || crf > 51 )); then
+        log "WARN" "Invalid video_slice_crf='${CONFIG[video_slice_crf]}', using 18"
+        crf=18
+    fi
+
+    local src_fps actual_fps
+    src_fps="$(_get_video_fps "$abs_video")"
+    if (( src_fps > 0 && src_fps < target_fps )); then
+        actual_fps="$src_fps"
+        log "INFO" "Source ${src_fps}fps < target ${target_fps}fps; keeping ${actual_fps}fps"
+    else
+        actual_fps="$target_fps"
+        log "INFO" "Target fps: ${actual_fps} (source: ${src_fps:-unknown})"
+    fi
+
+    local key_string="vspan2|${abs_video}|${mtime}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}|fps=${actual_fps}|crf=${crf}"
+    local i
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        key_string+="|${MONITOR_W[i]}x${MONITOR_H[i]}+${MONITOR_X[i]}+${MONITOR_Y[i]}"
+    done
+    local cache_key
+    cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
+    local split_dir="${CACHE_DIR}/vspan_${cache_key}"
+    mkdir -p "$split_dir"
+
+    log "INFO" "Span ${TOTAL_WIDTH}x${TOTAL_HEIGHT}, ${MONITOR_COUNT} monitors, ${actual_fps}fps crf=${crf}"
+    log "INFO" "Slice cache: $split_dir"
+
+    local files=()
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local out="${split_dir}/mon_${i}.mp4"
+        files+=("$out")
+
+        if [[ -f "$out" ]] && [[ "$out" -nt "$abs_video" ]]; then
+            log "INFO" "Monitor $i slice cached"
+            continue
+        fi
+
+        local mon_x="${MONITOR_X[i]}" mon_y="${MONITOR_Y[i]}"
+        local mon_w="${MONITOR_W[i]}" mon_h="${MONITOR_H[i]}"
+        local rel_x=$(( mon_x - MIN_X ))
+        local rel_y=$(( mon_y - MIN_Y ))
+        (( rel_x < 0 )) && rel_x=0
+        (( rel_y < 0 )) && rel_y=0
+
+        local vf="scale=${TOTAL_WIDTH}:${TOTAL_HEIGHT}:force_original_aspect_ratio=increase"
+        vf+=",crop=${TOTAL_WIDTH}:${TOTAL_HEIGHT}:(iw-${TOTAL_WIDTH})/2:(ih-${TOTAL_HEIGHT})/2"
+        vf+=",crop=${mon_w}:${mon_h}:${rel_x}:${rel_y}"
+        vf+=",fps=${actual_fps}"
+
+        log "INFO" "Cutting monitor $i: ${mon_w}x${mon_h}+${rel_x}+${rel_y} @ ${actual_fps}fps"
+        if ! ffmpeg -y -loglevel error -i "$abs_video" \
+                -vf "$vf" -an \
+                -c:v libx264 -crf "$crf" -preset medium \
+                "$out"; then
+            log "ERROR" "ffmpeg failed on monitor $i"
+            rm -f "$out"
+            return 1
+        fi
+    done
+
+    local daemon="${CONFIG[video_daemon]}"
+    assert_file_exists "$daemon" || { log "ERROR" "Daemon not found: $daemon"; return 1; }
+
+    log "INFO" "Launching ${#files[@]} slice(s) via daemon --per-monitor"
+    "$daemon" --per-monitor "${files[@]}" &
+    local pid=$!
+    disown
+    echo "$pid" > "$VIDEO_PID_FILE"
+    log "INFO" "Spanning video (pre-cut) started (PID $pid)"
+    return 0
+}
+
+set_video_on_wallpaper() {
+    if [[ $# -eq 0 ]]; then
+        log "ERROR" "Usage: set-video-on IDX:VIDEO [IDX:VIDEO ...]"
+        log "ERROR" "Example: set-video-on 0:~/a.mp4 2:~/b.mp4"
+        return 1
+    fi
+
+    local daemon="${CONFIG[video_daemon]}"
+    assert_file_exists "$daemon" || { log "ERROR" "Video daemon not found: $daemon"; return 1; }
+
+    get_monitor_info || return 1
+
+    local -a on_args=()
+    local pair idx path
+    for pair in "$@"; do
+        if [[ ! "$pair" =~ ^([0-9]+):(.+)$ ]]; then
+            log "ERROR" "Invalid argument (expected IDX:VIDEO): $pair"
+            return 1
+        fi
+        idx="${BASH_REMATCH[1]}"
+        path="${BASH_REMATCH[2]}"
+
+        if [[ "$path" == "~"* ]]; then
+            path="${HOME}${path:1}"
+        fi
+
+        if (( idx >= MONITOR_COUNT )); then
+            log "ERROR" "Monitor index $idx out of range (0..$((MONITOR_COUNT-1)))"
+            return 1
+        fi
+        assert_file_exists "$path" || return 1
+        on_args+=("${idx}:${path}")
+    done
+
+    stop_video_wallpaper
+    _ensure_fullscreen_monitor
+
+    log "INFO" "Starting daemon with --on ${on_args[*]}"
+    "$daemon" --on "${on_args[@]}" &
+    local pid=$!
+    disown
+    echo "$pid" > "$VIDEO_PID_FILE"
+    log "INFO" "Video(s) on selected monitors started (PID $pid)"
+    return 0
+}
+
+stop_video_wallpaper() {
+    if [[ -f "$VIDEO_PID_FILE" ]]; then
+        local pid
+        pid="$(cat "$VIDEO_PID_FILE")"
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            pkill -P "$pid" 2>/dev/null || true
+        fi
+        rm -f "$VIDEO_PID_FILE"
+        log "INFO" "Video wallpaper stopped."
+    fi
+    return 0
+}
+
+pause_video_wallpaper() {
+    if [[ ! -f "$VIDEO_PID_FILE" ]]; then
+        log "WARN" "No video wallpaper running."
+        return 1
+    fi
+    local pid
+    pid="$(cat "$VIDEO_PID_FILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -USR1 "$pid" 2>/dev/null
+        log "INFO" "Video wallpaper paused."
+        return 0
+    fi
+    log "WARN" "Video wallpaper not running (stale pid file)."
+    return 1
+}
+
+resume_video_wallpaper() {
+    if [[ ! -f "$VIDEO_PID_FILE" ]]; then
+        log "WARN" "No video wallpaper running."
+        return 1
+    fi
+    local pid
+    pid="$(cat "$VIDEO_PID_FILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -USR2 "$pid" 2>/dev/null
+        log "INFO" "Video wallpaper resumed."
+        return 0
+    fi
+    log "WARN" "Video wallpaper not running (stale pid file)."
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# Mixed media: images and videos per monitor
+# ----------------------------------------------------------------------
+_is_video_media() {
+    local file="$1"
+    case "$file" in
+        *.mp4|*.mkv|*.avi|*.mov|*.webm|*.gif|*.MP4|*.MKV|*.AVI|*.MOV|*.WEBM)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_build_mixed_canvas() {
+    local cache_file="$1"
+    shift
+    local -a entries=("$@")
+    local mode="${CONFIG[mode]}"
+    local i
+
+    local first_static=""
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local e="${entries[i]}"
+        if [[ "$e" != "none" ]] && ! _is_video_media "$e"; then
+            first_static="$e"
+            break
+        fi
+    done
+
+    local bg_canvas
+    if [[ -z "$first_static" ]]; then
+        bg_canvas="$(mktemp --suffix=.png)" || return 1
+        $IM_CMD -size "${TOTAL_WIDTH}x${TOTAL_HEIGHT}" "xc:${CONFIG[color]}" "$bg_canvas" || {
+            rm -f "$bg_canvas"; return 1
+        }
+    else
+        bg_canvas="$(_create_background_canvas "$first_static")" || return 1
+    fi
+
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local e="${entries[i]}"
+        if [[ "$e" == "none" ]] || _is_video_media "$e"; then
+            continue
+        fi
+        local proc_file
+        proc_file="$(process_image_for_area "$e" "${MONITOR_W[i]}" "${MONITOR_H[i]}" "$mode")" || {
+            rm -f "$bg_canvas"
+            return 1
+        }
+        $IM_CMD "$bg_canvas" "$proc_file" \
+            -geometry +"${MONITOR_X[i]}"+"${MONITOR_Y[i]}" \
+            -composite "$bg_canvas" || {
+            rm -f "$bg_canvas" "$proc_file"
+            return 1
+        }
+        rm -f "$proc_file"
+    done
+
+    $IM_CMD "$bg_canvas" -quality 95 "$cache_file" || {
+        rm -f "$bg_canvas"
+        return 1
+    }
+    rm -f "$bg_canvas"
+    return 0
+}
+
+set_mixed_media_wallpaper() {
+    local entries=("$@")
+    get_monitor_info || return 1
+
+    if [[ ${#entries[@]} -ne $MONITOR_COUNT ]]; then
+        log "ERROR" "Provide exactly $MONITOR_COUNT entries (image, video, or \"none\")."
+        return 1
+    fi
+
+    local -a video_indices=()
+    local -a video_paths=()
+    local i
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local e="${entries[i]}"
+        if [[ "$e" == "none" ]]; then
+            continue
+        fi
+        if [[ ! -f "$e" ]]; then
+            log "ERROR" "File not found: $e"
+            return 1
+        fi
+        if _is_video_media "$e"; then
+            video_indices+=("$i")
+            video_paths+=("$e")
+        fi
+    done
+
+    stop_video_wallpaper
+    _ensure_fullscreen_monitor
+
+    local daemon="${CONFIG[video_daemon]}"
+    assert_file_exists "$daemon" || { log "ERROR" "Video daemon not found: $daemon"; return 1; }
+
+    if [[ ${#video_indices[@]} -eq $MONITOR_COUNT ]]; then
+        log "INFO" "All entries are videos; using daemon per-monitor mode"
+        "$daemon" --per-monitor "${video_paths[@]}" &
+        local pid=$!
+        disown
+        echo "$pid" > "$VIDEO_PID_FILE"
+        log "INFO" "Per-monitor video wallpaper started (PID $pid)"
+        return 0
+    fi
+
+    get_total_span || return 1
+    mkdir -p "$CACHE_DIR"
+
+    local mode="${CONFIG[mode]}"
+    local key_string="mixed|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}|${mode}"
+    for i in $(seq 0 $((MONITOR_COUNT-1))); do
+        local e="${entries[i]}"
+        if [[ "$e" == "none" ]]; then
+            key_string+="|none"
+        else
+            local abs_e
+            abs_e="$(readlink -f "$e")"
+            key_string+="|${abs_e}|$(get_file_mtime "$abs_e")"
+        fi
+    done
+    local cache_key
+    cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
+    local cache_file="${CACHE_DIR}/${cache_key}.jpg"
+
+    if [[ ! -f "$cache_file" ]]; then
+        log "INFO" "Building mixed-media static background..."
+        _build_mixed_canvas "$cache_file" "${entries[@]}" || return 1
+    else
+        log "INFO" "Using cached mixed-media background"
+    fi
+
+    _apply_per_monitor_backend "$cache_file" || return 1
+
+    if [[ ${#video_indices[@]} -eq 0 ]]; then
+        log "INFO" "Static-only mixture; no videos to launch"
+        return 0
+    fi
+
+    local -a on_args=()
+    for i in "${!video_indices[@]}"; do
+        on_args+=("${video_indices[$i]}:${video_paths[$i]}")
+    done
+
+    log "INFO" "Starting daemon with --on ${on_args[*]}"
+    "$daemon" --on "${on_args[@]}" &
+    local pid=$!
+    disown
+    echo "$pid" > "$VIDEO_PID_FILE"
+    log "INFO" "Mixed media wallpaper started (PID $pid)"
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Refresh and helpers
 # ----------------------------------------------------------------------
 refresh_wallpaper() {
     assert_file_exists "$STATE_FILE" || { log "WARN" "No wallpaper state found"; return 1; }
@@ -894,7 +1372,7 @@ stop_random_mode() {
 }
 
 # ----------------------------------------------------------------------
-# Refresh daemon (with orphan cleanup)
+# Refresh daemon
 # ----------------------------------------------------------------------
 start_refresh_mode() {
     local interval="${1:-${CONFIG[refresh_interval]}}"
@@ -945,11 +1423,7 @@ start_refresh_mode() {
     return 0
 }
 
-# ----------------------------------------------------------------------
-# Stop refresh mode - PID-based (robust version)
-# ----------------------------------------------------------------------
 stop_refresh_mode() {
-    # Kill the main refresh process from REFRESH_FILE
     if [[ -f "$REFRESH_FILE" ]]; then
         local refresh_pid
         refresh_pid="$(tail -n1 "$REFRESH_FILE")"
@@ -959,7 +1433,6 @@ stop_refresh_mode() {
         rm -f "$REFRESH_FILE"
     fi
 
-    # Kill fullscreen monitor from its PID file
     if [[ -f "$FULLSCREEN_FILE" ]]; then
         local fs_pid
         fs_pid="$(cat "$FULLSCREEN_FILE")"
@@ -969,7 +1442,6 @@ stop_refresh_mode() {
         rm -f "$FULLSCREEN_FILE"
     fi
 
-    # Kill layout monitor from its PID file (may contain multiple PIDs: layout, workspace)
     if [[ -f "$LAYOUT_MONITOR_PIDFILE" ]]; then
         local pids
         pids="$(cat "$LAYOUT_MONITOR_PIDFILE")"
@@ -981,7 +1453,6 @@ stop_refresh_mode() {
         rm -f "$LAYOUT_MONITOR_PIDFILE"
     fi
 
-    # Fallback: pkill any remaining processes (just in case)
     pkill -f "ultraspan.*refresh" 2>/dev/null || true
     pkill -f "ultraspan.*monitor_fullscreen" 2>/dev/null || true
     pkill -f "ultraspan.*monitor_layout" 2>/dev/null || true
@@ -991,35 +1462,104 @@ stop_refresh_mode() {
     return 0
 }
 
+_ensure_fullscreen_monitor() {
+    [[ "${CONFIG[fullscreen_pause]}" == "true" ]] || return 0
+
+    if [[ -f "$FULLSCREEN_FILE" ]]; then
+        local fs_pid
+        fs_pid="$(cat "$FULLSCREEN_FILE")"
+        if [[ -n "$fs_pid" ]] && kill -0 "$fs_pid" 2>/dev/null; then
+            return 0   # already running
+        fi
+        rm -f "$FULLSCREEN_FILE"   # stale
+    fi
+
+    log "INFO" "Starting fullscreen monitor"
+    monitor_fullscreen &
+    echo $! > "$FULLSCREEN_FILE"
+    return 0
+}
+
+_pause_all_services() {
+    local refresh_pid="" random_pid=""
+    [[ -f "$REFRESH_FILE" ]] && refresh_pid="$(tail -n1 "$REFRESH_FILE")"
+    [[ -f "$RANDOM_FILE" ]] && random_pid="$(tail -n1 "$RANDOM_FILE")"
+    [[ -n "$refresh_pid" ]] && kill -STOP "$refresh_pid" 2>/dev/null || true
+    [[ -n "$random_pid" ]] && kill -STOP "$random_pid" 2>/dev/null || true
+    if [[ -f "$VIDEO_PID_FILE" ]]; then
+        kill -USR1 "$(cat "$VIDEO_PID_FILE")" 2>/dev/null
+    fi
+}
+
+_resume_all_services() {
+    local refresh_pid="" random_pid=""
+    [[ -f "$REFRESH_FILE" ]] && refresh_pid="$(tail -n1 "$REFRESH_FILE")"
+    [[ -f "$RANDOM_FILE" ]] && random_pid="$(tail -n1 "$RANDOM_FILE")"
+    [[ -n "$refresh_pid" ]] && kill -CONT "$refresh_pid" 2>/dev/null || true
+    [[ -n "$random_pid" ]] && kill -CONT "$random_pid" 2>/dev/null || true
+    if [[ -f "$VIDEO_PID_FILE" ]]; then
+        kill -USR2 "$(cat "$VIDEO_PID_FILE")" 2>/dev/null
+    fi
+}
+
 # ----------------------------------------------------------------------
 # Fullscreen & layout monitors
 # ----------------------------------------------------------------------
 monitor_fullscreen() {
-    local was_fullscreen=false
+    # state:
+    #   running   – no fullscreen; wallpaper plays
+    #   paused_fs – fullscreen active; wallpaper paused
+    #   grace     – fullscreen just ended; waiting `grace` seconds before resume
+    local state="running"
+    local resume_at=0
+    local grace=5
+    local now
     local iterations=0
+
     while (( iterations < WATCHDOG_LIMIT )); do
         ((iterations++))
         sleep 2
+        now="$(date +%s)"
+
         if is_fullscreen_active; then
-            if [[ "$was_fullscreen" == false ]]; then
-                log "INFO" "Full‑screen detected – pausing services"
-                local refresh_pid random_pid
-                [[ -f "$REFRESH_FILE" ]] && refresh_pid="$(tail -n1 "$REFRESH_FILE")"
-                [[ -f "$RANDOM_FILE" ]] && random_pid="$(tail -n1 "$RANDOM_FILE")"
-                [[ -n "$refresh_pid" ]] && kill -STOP "$refresh_pid" 2>/dev/null || true
-                [[ -n "$random_pid" ]] && kill -STOP "$random_pid" 2>/dev/null || true
-                was_fullscreen=true
-            fi
+            case "$state" in
+                running)
+                    log "INFO" "Full-screen detected – pausing services"
+                    _pause_all_services
+                    state="paused_fs"
+                    ;;
+                grace)
+                    log "INFO" "Full-screen returned during grace – staying paused"
+                    state="paused_fs"
+                    ;;
+                paused_fs)
+                    ;;
+            esac
+            resume_at=0
         else
-            if [[ "$was_fullscreen" == true ]]; then
-                log "INFO" "Full‑screen ended – resuming services"
-                local refresh_pid random_pid
-                [[ -f "$REFRESH_FILE" ]] && refresh_pid="$(tail -n1 "$REFRESH_FILE")"
-                [[ -f "$RANDOM_FILE" ]] && random_pid="$(tail -n1 "$RANDOM_FILE")"
-                [[ -n "$refresh_pid" ]] && kill -CONT "$refresh_pid" 2>/dev/null || true
-                [[ -n "$random_pid" ]] && kill -CONT "$random_pid" 2>/dev/null || true
-                was_fullscreen=false
-            fi
+            case "$state" in
+                paused_fs)
+                    # Reload config so grace can be changed live.
+                    load_config
+                    grace="${CONFIG[fullscreen_grace_seconds]:-5}"
+                    if ! [[ "$grace" =~ ^[0-9]+$ ]] || (( grace < 0 )); then
+                        grace=5
+                    fi
+                    resume_at=$(( now + grace ))
+                    log "INFO" "Full-screen ended – resuming in ${grace}s"
+                    state="grace"
+                    ;;
+                grace)
+                    if (( now >= resume_at )); then
+                        log "INFO" "Grace elapsed – resuming services"
+                        _resume_all_services
+                        state="running"
+                        resume_at=0
+                    fi
+                    ;;
+                running)
+                    ;;
+            esac
         fi
     done
     log "ERROR" "Fullscreen monitor exceeded limit. Exiting."
@@ -1044,9 +1584,6 @@ monitor_layout() {
     exit 0
 }
 
-# ----------------------------------------------------------------------
-# Workspace change monitor
-# ----------------------------------------------------------------------
 monitor_workspace() {
     sleep 2
     local last_ws=""
@@ -1149,7 +1686,7 @@ start_saved_random() {
 }
 
 # ----------------------------------------------------------------------
-# Data Wipe
+# Data wipe
 # ----------------------------------------------------------------------
 data_wipe_ultraspan() {
     echo "This will remove ALL ultraspan configuration, cache, and state files."
@@ -1164,6 +1701,7 @@ data_wipe_ultraspan() {
     stop_daemon
     stop_refresh_mode
     stop_random_mode
+    stop_video_wallpaper
 
     rm -rf "$CONFIG_DIR" "$CACHE_DIR" "$PID_DIR" "$LOCK_FILE"
 
@@ -1194,15 +1732,16 @@ stop_daemon() {
     fi
     stop_refresh_mode
     stop_random_mode
+    stop_video_wallpaper
     return 0
 }
 
 # ----------------------------------------------------------------------
-# Preview, list, diagnose (split into smaller functions)
+# Diagnose
 # ----------------------------------------------------------------------
 _diagnose_dependencies() {
     echo "Dependencies:"
-    for cmd in xrandr gsettings md5sum bc feh nitrogen; do
+    for cmd in xrandr gsettings md5sum bc feh nitrogen mpv xdotool ffmpeg ffprobe xterm; do
         if command -v "$cmd" &>/dev/null; then
             echo "  ✅ $cmd"
         else
@@ -1246,6 +1785,11 @@ _diagnose_services() {
     else
         echo "Daemon: not running"
     fi
+    if [[ -f "$VIDEO_PID_FILE" ]] && kill -0 "$(cat "$VIDEO_PID_FILE")" 2>/dev/null; then
+        echo "Video: running (PID $(cat "$VIDEO_PID_FILE"))"
+    else
+        echo "Video: not running"
+    fi
 }
 
 diagnose() {
@@ -1260,6 +1804,9 @@ diagnose() {
     return 0
 }
 
+# ----------------------------------------------------------------------
+# Preview / list
+# ----------------------------------------------------------------------
 preview_wallpaper() {
     local image="$1" mode="${2:-${CONFIG[mode]}}"
     local scale="800" scale_w scale_h temp_file
@@ -1327,7 +1874,11 @@ _ultraspan() {
     local cur prev words cword
     _init_completion || return
     case $prev in
-        set|set-per-monitor|random|random-multi|preview|info|list-images)
+        set|set-per-monitor|random|random-multi|preview|info|list-images|set-video|set-video-span|set-video-per-monitor|set-media)
+            _filedir
+            return
+            ;;
+        set-video-on)
             _filedir
             return
             ;;
@@ -1336,7 +1887,23 @@ _ultraspan() {
             ;;
     esac
     if [[ $cword -eq 1 ]]; then
-        COMPREPLY=($(compgen -W "set set-per-monitor random random-multi random-stop random-status interval refresh-start refresh-stop refresh-status status info list-images preview diagnose daemon daemon-stop data-wipe set-config clean restore help --version" -- "$cur"))
+        COMPREPLY=($(compgen -W "
+            set set-per-monitor
+            set-video set-video-span set-video-per-monitor set-video-on set-media
+            pause-video resume-video stop-video
+            random random-multi random-stop random-status
+            interval
+            refresh-start refresh-stop refresh-status refresh-wallpaper
+            status info list-images preview
+            diagnose
+            daemon daemon-stop
+            data-wipe
+            set-config
+            mode bg-type blur color fullscreen backend
+            clean restore
+            generate-systemd generate-completion
+            help --version
+        " -- "$cur"))
     fi
 }
 complete -F _ultraspan ultraspan
@@ -1348,39 +1915,70 @@ EOF
 # ----------------------------------------------------------------------
 show_help() {
     cat <<EOF
-Ultraspan v$VERSION - Advanced Multi‑Monitor Wallpaper Manager
+Ultraspan v$VERSION - Advanced Multi-Monitor Wallpaper Manager
 
-COMMANDS:
+IMAGES:
   set [--workspace N] IMAGE [MODE] [force]
-                                Set wallpaper (optionally for a specific workspace)
+                                Set a single image spanning all monitors
   set-per-monitor [--workspace N] IMG1 IMG2 ... [MODE]
-                                Set per‑monitor wallpapers (optionally for a workspace)
-  random DIR [MODE]             Start random rotation (single image)
-  random-multi DIR [MODE]       Start random per‑monitor rotation
+                                Set different images per monitor
+
+VIDEO (requires lightning-bug daemon):
+  set-video VIDEO_FILE          Span one video across all monitors
+                                (single decode, per-monitor crop)
+  set-video-span VIDEO_FILE     Same, but pre-cut with ffmpeg
+                                (lower GPU, cached per video)
+  set-video-per-monitor V1 V2 ... VN
+                                One independent video per monitor
+  set-video-on IDX:VIDEO ...    Videos on specific monitors only.
+                                Leaves wallpaper and other monitors alone.
+                                Example: set-video-on 0:~/a.mp4 2:~/b.mp4
+  set-media M1 M2 ... MN        Mix images and videos per monitor.
+                                Each M is an image, a video, or "none".
+                                Example: set-media ~/a.jpg ~/b.mp4 none
+
+VIDEO CONTROL:
+  pause-video                   Pause all running video playback
+  resume-video                  Resume playback
+  stop-video                    Stop any running video wallpaper
+
+ROTATION:
+  random DIR [MODE]             Start random single-image rotation
+  random-multi DIR [MODE]       Start random per-monitor rotation
   random-stop                   Stop random rotation
   random-status                 Show random status
-  interval MINUTES              Set random rotation interval
+  interval MINUTES              Set rotation interval
+
+REFRESH:
   refresh-start [MINUTES]       Start periodic refresh
   refresh-stop                  Stop periodic refresh
   refresh-status                Show refresh status
   refresh-wallpaper             Manually reapply current wallpaper
+
+SETTINGS:
+  mode MODE                     Set default mode (zoom/fit/center)
+  bg-type TYPE                  Set bg type (blur/solid)
+  blur VALUE                    Set blur amount (0-100)
+  color HEX                     Set solid color (e.g., #RRGGBB)
+  fullscreen [on/off]           Enable/disable auto-pause on fullscreen
+  backend [gsettings|feh|nitrogen]
+                                Choose wallpaper setter
+  set-config KEY VALUE          Update config directly
+
+SERVICE:
+  daemon [--foreground|--oneshot]
+                                Start all background services
+  daemon-stop                   Stop daemon
+  data-wipe                     Remove all ultraspan data (interactive)
+
+INSPECTION:
   status                        Show current settings and wallpaper
   info IMAGE                    Show image info
   preview IMAGE [MODE]          Generate a preview and open it
   list-images DIR               List all images with dimensions
   diagnose                      Run system diagnostics
-  daemon [--foreground|--oneshot]
-                                Start all background services (refresh + random)
-  daemon-stop                   Stop daemon
-  data-wipe                     Remove all ultraspan data (interactive)
-  set-config KEY VALUE          Update config directly
-  mode MODE                     Set default mode (zoom/fit/center)
-  bg-type TYPE                  Set bg type (blur/solid)
-  blur VALUE                    Set blur amount (0‑100)
-  color HEX                     Set solid color (e.g., #RRGGBB)
-  fullscreen [on/off]           Enable/disable auto‑pause on fullscreen
-  backend [gsettings|feh|nitrogen]
-                                Choose wallpaper setter
+
+UTILITIES:
   clean                         Clear cache
   restore                       Restore default system wallpaper
   generate-systemd              Print systemd service file
@@ -1388,25 +1986,34 @@ COMMANDS:
   help                          Show this help
   --version                     Show version
 
+DAEMON CONFIG (~/.config/ultraspan/video-daemon.conf):
+  vo=gpu-next                   mpv video output driver
+  hwdec=auto-safe               Hardware decoding mode
+  scale=bilinear                Scaling filter
+  start=0                       Seek to N seconds on load
+  log_file=/tmp/mpv.log         Where mpv writes its log
+  tick_seconds=5                Drift-check interval (seconds)
+
 WORKSPACES (requires per_workspace = true in config):
   Use --workspace N to assign wallpapers to a specific workspace.
-  Without the flag, the wallpaper is saved for the current workspace.
   Example:
     ultraspan set --workspace 2 ~/Pics/space.jpg zoom
-    ultraspan set-per-monitor --workspace 3 img1.jpg img2.jpg img3.jpg
+    ultraspan set-per-monitor --workspace 3 img1.jpg img2.jpg
 
 EXAMPLES:
   ultraspan set ~/Pics/wall.jpg zoom
+  ultraspan set-video ~/Videos/bg.mp4
+  ultraspan set-video-on 1:~/Videos/train.mp4
+  ultraspan set-media ~/Pics/photo.jpg ~/Videos/rain.mp4 none
+  ultraspan pause-video
   ultraspan random ~/Pictures/Wallpapers
-  ultraspan refresh-start 60
   ultraspan daemon
-  ultraspan set-config backend feh
   ultraspan diagnose
 EOF
 }
 
 # ----------------------------------------------------------------------
-# Command handlers (split from main)
+# Command handlers
 # ----------------------------------------------------------------------
 _handle_set() {
     local workspace=""
@@ -1502,6 +2109,7 @@ _handle_status() {
     echo "Cache limit: ${CONFIG[max_cache_mb]} MB"
     [[ -f "$RANDOM_FILE" ]] && echo "Random: active" || echo "Random: inactive"
     [[ -f "$REFRESH_FILE" ]] && echo "Refresh: active" || echo "Refresh: inactive"
+    [[ -f "$VIDEO_PID_FILE" ]] && echo "Spanning video: active (PID $(cat "$VIDEO_PID_FILE"))" || echo "Spanning video: inactive"
     return 0
 }
 
@@ -1601,11 +2209,19 @@ _handle_fullscreen() {
     local val
     case "$1" in on|true|1) val="true" ;; off|false|0) val="false" ;; *) log "ERROR" "Invalid value"; return 1 ;; esac
     update_config fullscreen_pause "$val" || return 1
+
+    # Restart the refresh stack so the new setting takes effect.
     if [[ -f "$REFRESH_FILE" ]]; then
         local interval
         interval="$(head -n1 "$REFRESH_FILE" | cut -d= -f2)"
         stop_refresh_mode
         start_refresh_mode "$interval"
+    fi
+
+    # If we just turned fullscreen-pause off, make sure the daemon
+    # isn't stuck in the paused state from before.
+    if [[ "$val" == "false" && -f "$VIDEO_PID_FILE" ]]; then
+        kill -USR2 "$(cat "$VIDEO_PID_FILE")" 2>/dev/null
     fi
     return 0
 }
@@ -1642,7 +2258,6 @@ _handle_restore() {
 # Main dispatcher
 # ----------------------------------------------------------------------
 main() {
-    # Ensure required directories exist
     mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$PID_DIR"
 
     load_config
@@ -1664,6 +2279,14 @@ main() {
     case "$cmd" in
         set) _handle_set "$@" ;;
         set-per-monitor) _handle_set_per_monitor "$@" ;;
+        set-video) set_video_wallpaper "$1" ;;
+        set-video-span) set_video_span_wallpaper "$1" ;;
+        set-video-per-monitor) set_video_per_monitor_wallpaper "$@" ;;
+        set-media) set_mixed_media_wallpaper "$@" ;;
+        set-video-on) set_video_on_wallpaper "$@" ;;
+        pause-video) pause_video_wallpaper ;;
+        resume-video) resume_video_wallpaper ;;
+        stop-video) stop_video_wallpaper ;;
         random) _handle_random "$@" ;;
         random-multi) _handle_random_multi "$@" ;;
         random-stop) stop_random_mode ;;
