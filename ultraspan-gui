@@ -208,9 +208,9 @@ def build_media_pixbuf(gtk, path: str):
                     pixbuf.savev(thumb_path, 'png', [], [])
                 except (gtk['GLib'].Error, OSError):
                     pass
-            except Exception as e:
-                print(f"[thumb] decode failed: {path}: {type(e).__name__}: {e}", file=sys.stderr)
-                pixbuf = None
+                except (gtk['GLib'].Error, OSError, ValueError) as e:
+                    print(f"[thumb] decode failed: {path}: {type(e).__name__}: {e}", file=sys.stderr)
+                    pixbuf = None
 
     if pixbuf is None:
         pixbuf = gtk['GdkPixbuf'].Pixbuf.new(
@@ -1092,7 +1092,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             for idx, path in enumerate(paths):
                 try:
                     pixbuf = build_media_pixbuf(gtk, path)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 — one bad file must not kill the whole thumbnail pass
                     print(f"[thumb] fatal: {path}: {e}", file=sys.stderr)
                     continue
                 gtk['GLib'].idle_add(self._add_thumbnail_to_flowbox, path, pixbuf)
