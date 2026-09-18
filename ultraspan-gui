@@ -194,13 +194,6 @@ def build_media_pixbuf(gtk, path: str):
         except gtk['GLib'].Error:
             pixbuf = None
 
-    if pixbuf is None:
-        if is_video_path(path):
-            if generate_video_thumbnail(path, thumb_path, size=134):
-                try:
-                    pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
-                except gtk['GLib'].Error:
-                    pixbuf = None
         else:
             try:
                 pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file_at_scale(path, 134, 134, True)
@@ -208,9 +201,9 @@ def build_media_pixbuf(gtk, path: str):
                     pixbuf.savev(thumb_path, 'png', [], [])
                 except (gtk['GLib'].Error, OSError):
                     pass
-                except (gtk['GLib'].Error, OSError, ValueError) as e:
-                    print(f"[thumb] decode failed: {path}: {type(e).__name__}: {e}", file=sys.stderr)
-                    pixbuf = None
+            except (gtk['GLib'].Error, OSError, ValueError) as e:
+                print(f"[thumb] decode failed: {path}: {type(e).__name__}: {e}", file=sys.stderr)
+                pixbuf = None
 
     if pixbuf is None:
         pixbuf = gtk['GdkPixbuf'].Pixbuf.new(
