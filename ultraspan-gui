@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.3.0
+# Version 1.4.0
 # ============================================
 
 from __future__ import annotations
@@ -20,25 +20,15 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
 
-# ----------------------------------------------------------------------
-# GTK module dictionary (initialised at import time)
-# ----------------------------------------------------------------------
 GTK = {
-    'Gtk': Gtk,
-    'Gio': Gio,
-    'GLib': GLib,
-    'Adw': Adw,
-    'Gdk': Gdk,
-    'GdkPixbuf': GdkPixbuf,
+    'Gtk': Gtk, 'Gio': Gio, 'GLib': GLib, 'Adw': Adw,
+    'Gdk': Gdk, 'GdkPixbuf': GdkPixbuf,
 }
 
-# ----------------------------------------------------------------------
-# Constants
-# ----------------------------------------------------------------------
 APP_ID = 'com.github.hisovereign.ultraspan'
 CONFIG_DIR = os.path.expanduser('~/.config/ultraspan')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config')
-STATE_FILE = os.path.join(CONFIG_DIR, 'state')
+DAEMON_CONFIG_FILE = os.path.join(CONFIG_DIR, 'video-daemon.conf')
 RANDOM_FILE = os.path.join(CONFIG_DIR, 'random')
 REFRESH_FILE = os.path.join(CONFIG_DIR, 'refresh')
 SCRIPT_PATH = shutil.which('ultraspan') or os.path.expanduser('~/.local/bin/ultraspan')
@@ -46,8 +36,13 @@ DEFAULT_FOLDER = os.path.expanduser('~/Pictures/ultraspan')
 THUMBNAIL_CACHE = os.path.expanduser('~/.cache/ultraspan/thumbnails')
 DAEMON_PID_FILE = os.path.join('/run/user', str(os.getuid()), 'ultraspan', 'daemon.pid')
 
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
+VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.gif')
+ALL_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+
+
 # ----------------------------------------------------------------------
-# Config handler
+# Config handler (script config: ~/.config/ultraspan/config)
 # ----------------------------------------------------------------------
 class UltraspanConfig:
     def __init__(self) -> None:
@@ -57,6 +52,9 @@ class UltraspanConfig:
             'blur': '15',
             'color': '#000000',
             'fullscreen_pause': 'true',
+            'fullscreen_grace_seconds': '5',
+            'video_slice_fps': '30',
+            'video_slice_crf': '18',
             'random_interval': '30',
             'refresh_interval': '480',
             'multi_random': 'false',
@@ -73,8 +71,6 @@ class UltraspanConfig:
         }
         self.values = self.defaults.copy()
         self.load()
-        assert self.values is not None, "Config values failed to initialise"
-        assert isinstance(self.defaults, dict), "Defaults must be dict"
 
     def load(self) -> None:
         if not os.path.exists(CONFIG_FILE):
@@ -97,18 +93,15 @@ class UltraspanConfig:
 
     def get(self, key: str) -> str:
         assert key in self.defaults, f"Unknown config key: {key}"
-        assert isinstance(key, str) and key, "Key must be non-empty string"
         return self.values.get(key, self.defaults.get(key, ''))
 
     def set(self, key: str, val: object) -> None:
         assert key in self.defaults, f"Unknown config key: {key}"
-        assert isinstance(key, str) and key, "Key must be non-empty string"
         self.values[key] = str(val)
         self.save()
 
     def get_int(self, key: str) -> int:
         assert key in self.defaults, f"Unknown config key: {key}"
-        assert isinstance(key, str) and key, "Key must be non-empty string"
         try:
             return int(self.get(key))
         except (ValueError, TypeError):
@@ -116,41 +109,118 @@ class UltraspanConfig:
 
     def get_bool(self, key: str) -> bool:
         assert key in self.defaults, f"Unknown config key: {key}"
-        assert isinstance(key, str) and key, "Key must be non-empty string"
-        val = self.get(key)
-        return val.lower() in ('true', 'yes', '1', 'on')
+        return self.get(key).lower() in ('true', 'yes', '1', 'on')
+
 
 # ----------------------------------------------------------------------
-# Thumbnail cache helper
+# Daemon config helpers (video-daemon.conf)
 # ----------------------------------------------------------------------
-def get_thumbnail_path(image_path: str, size: int = 120) -> str:
-    assert isinstance(image_path, str) and image_path, "Invalid image_path"
-    assert isinstance(size, int) and size > 0, "Invalid size"
+def read_daemon_config() -> dict:
+    out = {}
+    if not os.path.exists(DAEMON_CONFIG_FILE):
+        return out
+    with open(DAEMON_CONFIG_FILE) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#') or '=' not in stripped:
+                continue
+            k, v = stripped.split('=', 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def write_daemon_config(updates: dict) -> None:
+    os.makedirs(os.path.dirname(DAEMON_CONFIG_FILE), exist_ok=True)
+    lines = []
+    seen = set()
+    if os.path.exists(DAEMON_CONFIG_FILE):
+        with open(DAEMON_CONFIG_FILE) as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#') and '=' in stripped:
+                    k = stripped.split('=', 1)[0].strip()
+                    if k in updates:
+                        lines.append(f"{k}={updates[k]}\n")
+                        seen.add(k)
+                        continue
+                lines.append(line)
+    for k, v in updates.items():
+        if k not in seen:
+            lines.append(f"{k}={v}\n")
+    with open(DAEMON_CONFIG_FILE, 'w') as f:
+        f.writelines(lines)
+
+
+# ----------------------------------------------------------------------
+# Media helpers
+# ----------------------------------------------------------------------
+def is_video_path(path: str) -> bool:
+    return path.lower().endswith(VIDEO_EXTENSIONS)
+
+
+def get_thumbnail_path(media_path: str, size: int = 120) -> str:
     os.makedirs(THUMBNAIL_CACHE, exist_ok=True)
     try:
-        mtime = os.path.getmtime(image_path)
+        mtime = os.path.getmtime(media_path)
     except OSError:
         mtime = 0
-    key = f"{image_path}_{mtime}_{size}"
+    key = f"{media_path}_{mtime}_{size}"
     hash_name = hashlib.md5(key.encode()).hexdigest()
     return os.path.join(THUMBNAIL_CACHE, f"{hash_name}.png")
 
-# ----------------------------------------------------------------------
-# Helper function to create an ActionRow with a SpinButton
-# ----------------------------------------------------------------------
-def create_spin_row(
-    title: str,
-    subtitle: str | None,
-    min_val: float,
-    max_val: float,
-    step: float,
-    initial: float,
-    on_changed: object,
-) -> tuple[object, object]:
-    assert isinstance(title, str) and title, "Title must be non-empty string"
-    assert isinstance(min_val, (int, float)), "min_val must be number"
-    assert isinstance(max_val, (int, float)), "max_val must be number"
-    assert isinstance(initial, (int, float)), "initial must be number"
+
+def generate_video_thumbnail(video_path: str, thumb_path: str, size: int = 134) -> bool:
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-y', '-loglevel', 'error',
+             '-ss', '1', '-i', video_path,
+             '-vframes', '1',
+             '-vf', f'scale={size}:{size}:force_original_aspect_ratio=decrease',
+             thumb_path],
+            capture_output=True, timeout=20, check=False
+        )
+        return result.returncode == 0 and os.path.exists(thumb_path)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def build_media_pixbuf(gtk, path: str):
+    thumb_path = get_thumbnail_path(path, size=134)
+    pixbuf = None
+
+    if os.path.exists(thumb_path):
+        try:
+            pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
+        except gtk['GLib'].Error:
+            pixbuf = None
+
+    if pixbuf is None:
+        if is_video_path(path):
+            if generate_video_thumbnail(path, thumb_path, size=134):
+                try:
+                    pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
+                except gtk['GLib'].Error:
+                    pixbuf = None
+        else:
+            try:
+                pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file_at_scale(path, 134, 134, True)
+                try:
+                    pixbuf.savev(thumb_path, 'png', [], [])
+                except (gtk['GLib'].Error, OSError):
+                    pass
+            except Exception as e:
+                print(f"[thumb] decode failed: {path}: {type(e).__name__}: {e}", file=sys.stderr)
+                pixbuf = None
+
+    if pixbuf is None:
+        pixbuf = gtk['GdkPixbuf'].Pixbuf.new(
+            gtk['GdkPixbuf'].Colorspace.RGB, False, 8, 134, 134
+        )
+        pixbuf.fill(0x3a3a3aff)
+    return pixbuf
+
+
+def create_spin_row(title, subtitle, min_val, max_val, step, initial, on_changed):
     gtk = GTK
     row = gtk['Adw'].ActionRow.new()
     row.set_title(title)
@@ -163,25 +233,25 @@ def create_spin_row(
     row.set_activatable_widget(spin)
     return row, spin
 
+
 # ----------------------------------------------------------------------
-# Main Window
+# Main window
 # ----------------------------------------------------------------------
 class UltraspanWindow(GTK['Adw'].PreferencesWindow):
-    def __init__(self, app: object) -> None:
+    def __init__(self, app) -> None:
         super().__init__(title="Ultraspan Settings")
-        assert app is not None, "App reference cannot be None"
-        assert isinstance(app, object), "App must be an object"
         self.app = app
         self.config = UltraspanConfig()
+        self.set_default_size(650, 900)
 
-        self.set_default_size(650, 860)
-
-        self._updating_modes = False
         self.monitor_count = 0
-        self.selected_slots = []
-        self._selection_update_lock = False
         self._updating_widgets = False
         self._autostart_daemon_switch = None
+
+        # Per-mode selection state.
+        self.wallpaper_selection = None          # FlowBoxChild or None
+        self.per_monitor_slots = []              # [FlowBoxChild|None] * monitor_count
+        self.video_selections = []               # [FlowBoxChild] with .assigned_monitor
 
         self._setup_styles()
         self._build_pages()
@@ -189,14 +259,11 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self._monitor_daemon()
         self.connect('notify::visible-page', self._on_visible_page_changed)
         self._update_service_status()
-        self._apply_gui_background()          # add this line
-        assert hasattr(self, 'wallpaper_flowbox'), "Wallpaper flowbox not created"
-        assert hasattr(self, 'status_page'), "Status page not created"
+        self._apply_gui_background()
 
     def _setup_styles(self) -> None:
         gtk = GTK
         css_provider = gtk['Gtk'].CssProvider.new()
-        assert css_provider is not None, "Failed to create CSS provider"
         css_provider.load_from_data(b"""
         .badge {
             background-color: rgba(0, 0, 0, 0.7);
@@ -205,20 +272,22 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             padding: 2px 6px;
             border-radius: 9999px;
         }
+        .video-badge {
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            font-weight: bold;
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-size: 10px;
+        }
         preferencespage > box { padding-top: 0px; padding-bottom: 8px; }
         preferencespage > box > preferencesgroup {
             margin-top: 0px;
             margin-bottom: 4px;
         }
-        .wallpaper-child { padding: 0px; margin: 0px; }
+        .wallpaper-child { padding: 0px; margin: 0px; background: transparent; border: none; box-shadow: none; outline: none; }
         .wallpaper-child image { padding: 0px; margin: 0px; }
         .wallpaper-child label { padding-top: 0px; margin-top: 0px; }
-        .wallpaper-child {
-            background: transparent;
-            border: none;
-            box-shadow: none;
-            outline: none;
-        }
         .wallpaper-child.selected {
             outline: 2px solid @theme_selected_bg_color;
             outline-offset: -2px;
@@ -229,22 +298,120 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             css_provider,
             gtk['Gtk'].STYLE_PROVIDER_PRIORITY_APPLICATION
         )
-        # Dedicated provider for dynamic background image (to be toggled on/off)
         self._background_provider = gtk['Gtk'].CssProvider.new()
         gtk['Gtk'].StyleContext.add_provider_for_display(
             gtk['Gdk'].Display.get_default(),
             self._background_provider,
             gtk['Gtk'].STYLE_PROVIDER_PRIORITY_USER
         )
-        assert gtk['Gdk'].Display.get_default() is not None, "No default display available"
+
+    def _on_restart_video_clicked(self, btn) -> None:
+        script_pid_file = os.path.expanduser('~/.config/ultraspan/video.pid')
+        daemon_pid_file = f'/run/user/{os.getuid()}/ultraspan/video-daemon.pid'
+
+        # Find the live daemon pid from either tracker.
+        pid = None
+        for pf in (script_pid_file, daemon_pid_file):
+            try:
+                with open(pf) as f:
+                    candidate = int(f.read().strip())
+                os.kill(candidate, 0)  # probe
+                pid = candidate
+                break
+            except (OSError, ValueError, FileNotFoundError):
+                continue
+
+        if pid is None:
+            self._flash_button(btn, "No video running")
+            return
+
+        # Read argv before killing.
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                raw = f.read()
+            args = [a.decode(errors='replace') for a in raw.split(b'\0') if a]
+        except OSError:
+            self._flash_button(btn, "Cmdline unavailable")
+            return
+
+        if not args:
+            self._flash_button(btn, "Empty cmdline")
+            return
+
+        # Kill the daemon directly (SIGTERM), then remove stale pid files.
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        for pf in (script_pid_file, daemon_pid_file):
+            try:
+                os.remove(pf)
+            except FileNotFoundError:
+                pass
+
+        def relaunch():
+            import time
+            # Wait for the old process to fully exit (up to 3s).
+            for _ in range(30):
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.1)
+                except OSError:
+                    break
+
+            try:
+                proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as e:
+                print(f"[restart] failed: {e}", file=sys.stderr)
+                return
+
+            # Give the daemon a moment to settle, then write the script's
+            # tracker so `ultraspan stop-video` keeps working.
+            time.sleep(0.6)
+            try:
+                with open(script_pid_file, 'w') as f:
+                    f.write(str(proc.pid))
+            except OSError as e:
+                print(f"[restart] pid-file write failed: {e}", file=sys.stderr)
+
+        threading.Thread(target=relaunch, daemon=True).start()
+        self._flash_button(btn, "Restarting…")
+
+    def _flash_button(self, btn, text: str) -> None:
+        original = btn.get_label()
+        btn.set_label(text)
+        GTK['GLib'].timeout_add(1500, lambda: btn.set_label(original) or False)
+
+    # ------------------------------------------------------------------
+    # Mode helpers
+    # ------------------------------------------------------------------
+    def _current_mode(self) -> str:
+        if self.mode_video_btn.get_active():
+            return 'video'
+        if self.mode_per_monitor_btn.get_active():
+            return 'per_monitor'
+        return 'wallpaper'
 
     def _get_current_max_allowed(self) -> int:
-        assert self.mode_single_btn is not None, "mode_single_btn not initialised"
-        assert self.monitor_count >= 0, "monitor_count must be non-negative"
-        return 1 if self.mode_single_btn.get_active() else self.monitor_count
+        return 1 if self.mode_wallpaper_btn.get_active() else self.monitor_count
 
-    def _on_visible_page_changed(self, window: object, pspec: object) -> None:
-        assert self.status_page is not None, "Status page not created"
+    def _is_daemon_running(self) -> bool:
+        if not os.path.exists(DAEMON_PID_FILE):
+            return False
+        try:
+            with open(DAEMON_PID_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _on_visible_page_changed(self, window, pspec) -> None:
         if self.get_visible_page() == self.status_page:
             stdout, stderr, returncode = self._run_ultraspan(["diagnose"])
             if stdout.strip():
@@ -255,52 +422,34 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 detail = stderr.strip() if stderr.strip() else f"Exit code {returncode}"
                 self.status_label.set_text(f"Diagnostics failed:\n{detail}")
 
-    def _is_daemon_running(self) -> bool:
-        assert isinstance(DAEMON_PID_FILE, str) and DAEMON_PID_FILE, "Invalid DAEMON_PID_FILE"
-        if not os.path.exists(DAEMON_PID_FILE):
-            return False
-        try:
-            with open(DAEMON_PID_FILE, 'r') as f:
-                pid = int(f.read().strip())
-            assert pid > 0, "Daemon PID must be positive"
-            os.kill(pid, 0)
-            return True
-        except (OSError, ValueError):
-            return False
-
     # ------------------------------------------------------------------
-    # Page dispatcher
+    # Page build
     # ------------------------------------------------------------------
     def _build_pages(self) -> None:
         gtk = GTK
-        assert gtk is not None, "GTK dict is None"
-        assert callable(getattr(self, '_build_wallpapers_page', None)), "Missing wallpapers page builder"
         self._build_wallpapers_page(gtk)
         self._build_general_page(gtk)
         self._build_rotation_page(gtk)
         self._build_status_page(gtk)
-        self._on_mode_toggled(self.mode_single_btn)
+        # Apply the initial toggle state so the highlight lands on "Wallpaper".
+        self._on_wallpaper_mode_toggled(self.mode_wallpaper_btn)
 
     # ------------------------------------------------------------------
-    # Page builders (each under 60 lines)
+    # Wallpapers page
     # ------------------------------------------------------------------
-    def _build_wallpapers_page(self, gtk: dict[str, object]) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        wallpapers_page = gtk['Adw'].PreferencesPage.new()
-        assert wallpapers_page is not None, "Failed to create wallpapers page"
-        wallpapers_page.set_title("Wallpapers")
-        wallpapers_page.set_icon_name("preferences-desktop-wallpaper-symbolic")
-        self.add(wallpapers_page)
-        self._build_folder_group(gtk, wallpapers_page)
-        self._build_images_group(gtk, wallpapers_page)
-        self._build_monitor_group(gtk, wallpapers_page)
+    def _build_wallpapers_page(self, gtk) -> None:
+        page = gtk['Adw'].PreferencesPage.new()
+        page.set_title("Wallpapers")
+        page.set_icon_name("preferences-desktop-wallpaper-symbolic")
+        self.add(page)
+        self._build_folder_group(gtk, page)
+        self._build_images_group(gtk, page)
+        self._build_monitor_group(gtk, page)
 
-    def _build_folder_group(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-        folder_group = gtk['Adw'].PreferencesGroup.new()
-        folder_group.set_title("Wallpaper Folder")
-        page.add(folder_group)
+    def _build_folder_group(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Wallpaper Folder")
+        page.add(group)
         self.folder_button = gtk['Gtk'].Button.new_with_label(self.config.get('wallpaper_folder'))
         self.folder_button.set_halign(gtk['Gtk'].Align.FILL)
         self.folder_button.set_hexpand(True)
@@ -309,19 +458,18 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.folder_button.set_margin_top(4)
         self.folder_button.set_margin_bottom(4)
         self.folder_button.connect('clicked', self._on_choose_folder_clicked)
-        folder_group.add(self.folder_button)
-        assert self.folder_button is not None, "Folder button not created"
+        group.add(self.folder_button)
 
-    def _build_images_group(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-        list_group = gtk['Adw'].PreferencesGroup.new()
-        list_group.set_title("Images")
-        page.add(list_group)
+    def _build_images_group(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Images &amp; Videos")
+        page.add(group)
+
         scrolled = gtk['Gtk'].ScrolledWindow.new()
-        scrolled.set_min_content_height(425)
+        scrolled.set_min_content_height(400)
         scrolled.set_policy(gtk['Gtk'].PolicyType.NEVER, gtk['Gtk'].PolicyType.AUTOMATIC)
-        list_group.add(scrolled)
+        group.add(scrolled)
+
         self.wallpaper_flowbox = gtk['Gtk'].FlowBox.new()
         self.wallpaper_flowbox.set_selection_mode(gtk['Gtk'].SelectionMode.NONE)
         self.wallpaper_flowbox.set_valign(gtk['Gtk'].Align.START)
@@ -332,131 +480,106 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.wallpaper_flowbox.set_column_spacing(0)
         scrolled.set_child(self.wallpaper_flowbox)
 
-        # Mode buttons as header suffix of Images group
+        # Three exclusive toggles: Wallpaper | Per-Monitor | Video
         mode_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 0)
         mode_box.set_halign(gtk['Gtk'].Align.END)
         mode_box.set_valign(gtk['Gtk'].Align.CENTER)
-        mode_box.set_margin_top(0)
-        mode_box.set_margin_bottom(0)
 
-        self.mode_single_btn = gtk['Gtk'].ToggleButton.new_with_label("Wallpaper")
-        self.mode_single_btn.add_css_class("suggested-action")
-        self.mode_single_btn.set_active(True)
-        self.mode_single_btn.connect('toggled', self._on_mode_toggled)
+        self.mode_wallpaper_btn = gtk['Gtk'].ToggleButton.new_with_label("Wallpaper")
+        self.mode_wallpaper_btn.add_css_class("suggested-action")
+        self.mode_wallpaper_btn.set_active(True)
 
         self.mode_per_monitor_btn = gtk['Gtk'].ToggleButton.new_with_label("Per‑Monitor")
-        self.mode_per_monitor_btn.connect('toggled', self._on_mode_toggled)
+        self.mode_video_btn = gtk['Gtk'].ToggleButton.new_with_label("Video")
 
-        mode_box.append(self.mode_single_btn)
-        mode_box.append(self.mode_per_monitor_btn)
+        # Group them so only one is active at a time.
+        self.mode_per_monitor_btn.set_group(self.mode_wallpaper_btn)
+        self.mode_video_btn.set_group(self.mode_wallpaper_btn)
+
+        for btn in (self.mode_wallpaper_btn, self.mode_per_monitor_btn, self.mode_video_btn):
+            btn.connect('toggled', self._on_wallpaper_mode_toggled)
+            mode_box.append(btn)
 
         try:
-            list_group.set_header_suffix(mode_box)
+            group.set_header_suffix(mode_box)
         except AttributeError:
-            header_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 6)
-            header_box.set_margin_start(8)
-            header_box.set_margin_end(8)
-            header_box.set_margin_top(4)
-            header_box.set_margin_bottom(4)
-            mode_box.set_halign(gtk['Gtk'].Align.END)
-            header_box.append(mode_box)
-            list_group.add(header_box)
+            pass
 
-        self.list_group = list_group
-        assert self.list_group is not None, "list_group not set"
-        assert self.mode_single_btn is not None, "Mode button not created"
+    def _build_monitor_group(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Monitors")
+        page.add(group)
 
-    def _build_monitor_group(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-        monitor_group = gtk['Adw'].PreferencesGroup.new()
-        monitor_group.set_title("Monitors")
-        page.add(monitor_group)
-        monitor_hbox = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 4)
-        monitor_hbox.set_margin_start(6)
-        monitor_hbox.set_margin_end(6)
+        hbox = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 4)
+        hbox.set_margin_start(6)
+        hbox.set_margin_end(6)
+
         self.monitor_list_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.VERTICAL, 0)
         self.monitor_list_box.set_hexpand(True)
-        self.monitor_list_box.set_halign(gtk['Gtk'].Align.FILL)
-        monitor_hbox.append(self.monitor_list_box)
-        right_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.VERTICAL, 4)
-        right_box.set_valign(gtk['Gtk'].Align.END)
+        hbox.append(self.monitor_list_box)
 
-        # Horizontal row for refresh and folder icons
+        right = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.VERTICAL, 4)
+        right.set_valign(gtk['Gtk'].Align.END)
+
         icon_row = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 4)
         icon_row.set_halign(gtk['Gtk'].Align.END)
 
-        # Refresh icon button
-        refresh_icon_btn = gtk['Gtk'].Button.new_from_icon_name("view-refresh-symbolic")
-        refresh_icon_btn.set_tooltip_text("Refresh images and clears selection")
-        refresh_icon_btn.connect('clicked', self._on_refresh_images_clicked)
-        refresh_icon_btn.set_halign(gtk['Gtk'].Align.END)
-        icon_row.append(refresh_icon_btn)
+        refresh_btn = gtk['Gtk'].Button.new_from_icon_name("view-refresh-symbolic")
+        refresh_btn.set_tooltip_text("Refresh media and clear selection")
+        refresh_btn.connect('clicked', self._on_refresh_images_clicked)
+        icon_row.append(refresh_btn)
 
-        # Folder icon button (opens the selected wallpaper folder)
-        folder_icon_btn = gtk['Gtk'].Button.new_from_icon_name("folder-symbolic")
-        folder_icon_btn.set_tooltip_text("Open wallpaper folder")
-        folder_icon_btn.connect('clicked', self._on_open_folder_clicked)
-        folder_icon_btn.set_halign(gtk['Gtk'].Align.END)
-        icon_row.append(folder_icon_btn)
+        folder_btn = gtk['Gtk'].Button.new_from_icon_name("folder-symbolic")
+        folder_btn.set_tooltip_text("Open wallpaper folder")
+        folder_btn.connect('clicked', self._on_open_folder_clicked)
+        icon_row.append(folder_btn)
 
-        right_box.append(icon_row)
+        right.append(icon_row)
 
         self.apply_btn = gtk['Gtk'].Button.new_with_label("Apply")
         self.apply_btn.add_css_class("suggested-action")
-        self.apply_btn.set_valign(gtk['Gtk'].Align.END)
-        self.apply_btn.set_halign(gtk['Gtk'].Align.END)
         self.apply_btn.connect('clicked', self._on_apply_clicked)
-        right_box.append(self.apply_btn)
-        monitor_hbox.append(right_box)
-        monitor_group.add(monitor_hbox)
+        right.append(self.apply_btn)
+        hbox.append(right)
+        group.add(hbox)
         self._populate_monitor_list()
-        assert self.monitor_list_box is not None, "Monitor list box not created"
-        assert self.apply_btn is not None, "Apply button not created"
 
-    def _build_general_page(self, gtk: dict[str, object]) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        general_page = gtk['Adw'].PreferencesPage.new()
-        general_page.set_title("General")
-        general_page.set_icon_name("preferences-system-symbolic")
-        self.add(general_page)
-        self._build_display_mode_section(gtk, general_page)
-        self._build_background_section(gtk, general_page)
-        self._build_general_settings_section(gtk, general_page)
-        self._build_backend_section(gtk, general_page)
-        self._build_auto_services_section(gtk, general_page)
-        self._build_custom_background_section(gtk, general_page)
+    # ------------------------------------------------------------------
+    # General page
+    # ------------------------------------------------------------------
+    def _build_general_page(self, gtk) -> None:
+        page = gtk['Adw'].PreferencesPage.new()
+        page.set_title("General")
+        page.set_icon_name("preferences-system-symbolic")
+        self.add(page)
+        self._build_display_mode_section(gtk, page)
+        self._build_background_section(gtk, page)
+        self._build_general_settings_section(gtk, page)
+        self._build_video_settings_section(gtk, page)
+        self._build_playback_section(gtk, page)
+        self._build_backend_section(gtk, page)
+        self._build_auto_services_section(gtk, page)
+        self._build_custom_background_section(gtk, page)
 
-    def _build_display_mode_section(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-        mode_group = gtk['Adw'].PreferencesGroup.new()
-        mode_group.set_title("Display Mode")
-        page.add(mode_group)
-        mode_row = gtk['Adw'].ComboRow.new()
-        mode_row.set_title("Mode")
-        mode_row.set_subtitle("How the image fits the screen")
+    def _build_display_mode_section(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Display Mode")
+        page.add(group)
+        row = gtk['Adw'].ComboRow.new()
+        row.set_title("Mode")
+        row.set_subtitle("How the image fits the screen")
         model = gtk['Gtk'].StringList.new(["zoom", "fit", "center"])
-        mode_row.set_model(model)
-        mode_row.set_selected(self._get_index(model, self.config.get('mode')))
-        mode_row.connect('notify::selected', self._on_mode_changed)
-        mode_group.add(mode_row)
-        self.mode_row = mode_row
-        assert self.mode_row is not None, "Mode row not created"
+        row.set_model(model)
+        row.set_selected(self._get_index(model, self.config.get('mode')))
+        row.connect('notify::selected', self._on_mode_changed)
+        group.add(row)
+        self.mode_row = row
 
-    def _build_background_section(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-        bg_group = gtk['Adw'].PreferencesGroup.new()
-        bg_group.set_title("Background")
-        page.add(bg_group)
-        self._build_bg_type_row(gtk, bg_group)
-        self._build_blur_scale(gtk, bg_group)
-        self._build_color_button(gtk, bg_group)
+    def _build_background_section(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Background")
+        page.add(group)
 
-    def _build_bg_type_row(self, gtk: dict[str, object], group: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert group is not None, "Group cannot be None"
         bg_type_row = gtk['Adw'].ComboRow.new()
         bg_type_row.set_title("Type")
         bg_type_row.set_subtitle("Blurred image or solid color")
@@ -466,11 +589,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         bg_type_row.connect('notify::selected', self._on_bg_type_changed)
         group.add(bg_type_row)
         self.bg_type_row = bg_type_row
-        assert self.bg_type_row is not None, "BG type row not created"
 
-    def _build_blur_scale(self, gtk: dict[str, object], group: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert group is not None, "Group cannot be None"
         blur_row = gtk['Adw'].ActionRow.new()
         blur_row.set_title("Blur Amount")
         blur_row.set_subtitle("Strength of the blur effect (0–100)")
@@ -482,11 +601,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         blur_row.set_activatable_widget(blur_scale)
         group.add(blur_row)
         self.blur_scale = blur_scale
-        assert self.blur_scale is not None, "Blur scale not created"
 
-    def _build_color_button(self, gtk: dict[str, object], group: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert group is not None, "Group cannot be None"
         color_row = gtk['Adw'].ActionRow.new()
         color_row.set_title("Solid Color")
         color_row.set_subtitle("Color used when background type is solid")
@@ -494,11 +609,11 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         color_str = self.config.get('color')
         if not rgba.parse(color_str if color_str else '#000000'):
             rgba.parse('#000000')
-        color_dialog = gtk['Gtk'].ColorDialog.new()
-        color_dialog.set_title("Choose Solid Color")
-        color_btn = gtk['Gtk'].ColorDialogButton.new(color_dialog)
+        dialog = gtk['Gtk'].ColorDialog.new()
+        dialog.set_title("Choose Solid Color")
+        color_btn = gtk['Gtk'].ColorDialogButton.new(dialog)
         color_btn.props.rgba = rgba
-        color_btn.set_size_request(24, 24)          # square, smaller
+        color_btn.set_size_request(24, 24)
         color_btn.set_halign(gtk['Gtk'].Align.CENTER)
         color_btn.set_valign(gtk['Gtk'].Align.CENTER)
         color_btn.set_margin_start(0)
@@ -508,191 +623,231 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         color_row.set_activatable_widget(color_btn)
         group.add(color_row)
         self.color_btn = color_btn
-        assert self.color_btn is not None, "Color button not created"
 
-    def _build_general_settings_section(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-        general_settings_group = gtk['Adw'].PreferencesGroup.new()
-        general_settings_group.set_title("General Settings")
-        page.add(general_settings_group)
+    def _build_general_settings_section(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  General Settings")
+        page.add(group)
+
         fullscreen_row = gtk['Adw'].SwitchRow.new()
         fullscreen_row.set_title("Pause on Fullscreen")
         fullscreen_row.set_subtitle("Pause refresh/random when a fullscreen app is active")
         fullscreen_row.set_active(self.config.get_bool('fullscreen_pause'))
         fullscreen_row.connect('notify::active', self._on_fullscreen_toggled)
-        general_settings_group.add(fullscreen_row)
+        group.add(fullscreen_row)
         self.fullscreen_row = fullscreen_row
+
         workspace_row = gtk['Adw'].SwitchRow.new()
         workspace_row.set_title("Per‑Workspace Wallpapers")
         workspace_row.set_subtitle("Different wallpaper for each workspace")
         workspace_row.set_active(self.config.get_bool('per_workspace'))
         workspace_row.connect('notify::active', self._on_workspace_toggled)
-
-        autostart_daemon_row = gtk['Adw'].SwitchRow.new()
-        autostart_daemon_row.set_title("Start auto services on Login")
-        autostart_daemon_row.set_subtitle("Run background services automatically when you log in")
-        autostart_daemon_row.set_active(self._is_autostart_enabled())
-        autostart_daemon_row.connect('notify::active', self._on_autostart_daemon_toggled)
-        general_settings_group.add(autostart_daemon_row)
-        self._autostart_daemon_switch = autostart_daemon_row
-        general_settings_group.add(workspace_row)
+        group.add(workspace_row)
         self.workspace_row = workspace_row
-        assert self.fullscreen_row is not None, "Fullscreen row not created"
-        assert self.workspace_row is not None, "Workspace row not created"
 
-    def _build_backend_section(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-        backend_group = gtk['Adw'].PreferencesGroup.new()
-        backend_group.set_title("Wallpaper Backend")
-        page.add(backend_group)
-        backend_row = gtk['Adw'].ComboRow.new()
-        backend_row.set_title("Backend")
-        backend_row.set_subtitle("Tool used to set the wallpaper")
+        autostart_row = gtk['Adw'].SwitchRow.new()
+        autostart_row.set_title("Start auto services on Login")
+        autostart_row.set_subtitle("Run background services automatically when you log in")
+        autostart_row.set_active(self._is_autostart_enabled())
+        autostart_row.connect('notify::active', self._on_autostart_daemon_toggled)
+        group.add(autostart_row)
+        self._autostart_daemon_switch = autostart_row
+
+    def _build_video_settings_section(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Video")
+        group.set_description("  Live wallpaper settings")
+        page.add(group)
+
+        grace_row, self.video_grace_spin = create_spin_row(
+            "Fullscreen grace period",
+            "Seconds to wait before resuming after fullscreen ends",
+            0, 300, 1, self.config.get_int('fullscreen_grace_seconds'),
+            self._on_fullscreen_grace_changed,
+        )
+        group.add(grace_row)
+
+        # Click re-lower toggle — lives in the daemon config, not the script.
+        daemon_cfg = read_daemon_config()
+        current = daemon_cfg.get('click_relower', 'true').lower() in ('true', 'yes', '1', 'on')
+        click_row = gtk['Adw'].SwitchRow.new()
+        click_row.set_title("Re-lower window on click")
+        click_row.set_subtitle("Prevents the wallpaper briefly flashing to the front when clicked "
+                               "(requires video restart)")
+        click_row.set_active(current)
+        click_row.connect('notify::active', self._on_click_relower_toggled)
+        group.add(click_row)
+        self.click_relower_row = click_row
+
+        # Restart row
+        restart_row = gtk['Adw'].ActionRow.new()
+        restart_row.set_title("Restart video")
+        restart_row.set_subtitle("Reload the running video so settings changes take effect")
+        self.restart_btn = gtk['Gtk'].Button.new_with_label("Restart")
+        self.restart_btn.set_valign(gtk['Gtk'].Align.CENTER)
+        self.restart_btn.connect('clicked', self._on_restart_video_clicked)
+        restart_row.add_suffix(self.restart_btn)
+        restart_row.set_activatable_widget(self.restart_btn)
+        group.add(restart_row)
+
+    def _build_playback_section(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Playback")
+        group.set_description("  Control the currently-running video wallpaper")
+        page.add(group)
+
+        row = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 6)
+        row.set_margin_start(6)
+        row.set_margin_end(6)
+        row.set_margin_top(6)
+        row.set_margin_bottom(6)
+        row.set_homogeneous(True)
+
+        pause_btn = gtk['Gtk'].Button.new_with_label("Pause")
+        pause_btn.connect('clicked', lambda *a: self._run_ultraspan_async(["pause-video"]))
+        row.append(pause_btn)
+
+        resume_btn = gtk['Gtk'].Button.new_with_label("Resume")
+        resume_btn.connect('clicked', lambda *a: self._run_ultraspan_async(["resume-video"]))
+        row.append(resume_btn)
+
+        stop_btn = gtk['Gtk'].Button.new_with_label("Stop")
+        stop_btn.connect('clicked', lambda *a: self._run_ultraspan_async(["stop-video"]))
+        row.append(stop_btn)
+
+        group.add(row)
+
+    def _build_backend_section(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Wallpaper Backend")
+        page.add(group)
+        row = gtk['Adw'].ComboRow.new()
+        row.set_title("Backend")
+        row.set_subtitle("Tool used to set the wallpaper")
         model = gtk['Gtk'].StringList.new(["gsettings", "feh", "nitrogen"])
-        backend_row.set_model(model)
-        backend_row.set_selected(self._get_index(model, self.config.get('backend')))
-        backend_row.connect('notify::selected', self._on_backend_changed)
-        backend_group.add(backend_row)
-        self.backend_row = backend_row
-        assert self.backend_row is not None, "Backend row not created"
+        row.set_model(model)
+        row.set_selected(self._get_index(model, self.config.get('backend')))
+        row.connect('notify::selected', self._on_backend_changed)
+        group.add(row)
+        self.backend_row = row
 
-    def _build_auto_services_section(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-        daemon_group = gtk['Adw'].PreferencesGroup.new()
-        daemon_group.set_title("Auto Services")
-        daemon_group.set_description("Background services for per‑workspace, refresh, and random")
-        page.add(daemon_group)
+    def _build_auto_services_section(self, gtk, page) -> None:
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Auto Services")
+        group.set_description("  Background services for per‑workspace, refresh, and random")
+        page.add(group)
         self.daemon_switch = gtk['Adw'].SwitchRow.new()
         self.daemon_switch.set_title("Run background services")
         self.daemon_switch.set_subtitle("Required for per‑workspace wallpapers and periodic services")
         self.daemon_switch.set_active(self._is_daemon_running())
         self.daemon_switch.connect('notify::active', self._on_daemon_toggled)
-        daemon_group.add(self.daemon_switch)
-        assert self.daemon_switch is not None, "Daemon switch not created"
+        group.add(self.daemon_switch)
 
-    def _build_rotation_page(self, gtk: dict[str, object]) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        rotation_page = gtk['Adw'].PreferencesPage.new()
-        rotation_page.set_title("Rotation")
-        rotation_page.set_icon_name("media-playback-start-symbolic")
-        self.add(rotation_page)
+    def _build_rotation_page(self, gtk) -> None:
+        page = gtk['Adw'].PreferencesPage.new()
+        page.set_title("Rotation")
+        page.set_icon_name("media-playback-start-symbolic")
+        self.add(page)
+
         random_group = gtk['Adw'].PreferencesGroup.new()
-        random_group.set_title("Random Rotation")
-        rotation_page.add(random_group)
-        random_interval_row, self.random_spin = create_spin_row(
+        random_group.set_title("  Random Rotation")
+        page.add(random_group)
+
+        row, self.random_spin = create_spin_row(
             "Interval (minutes)", "Time between wallpaper changes",
             1, 360, 1, self.config.get_int('random_interval'),
-            self._on_random_interval_changed
+            self._on_random_interval_changed,
         )
-        random_group.add(random_interval_row)
-        multi_random_row = gtk['Adw'].SwitchRow.new()
-        multi_random_row.set_title("Multi‑monitor Random")
-        multi_random_row.set_subtitle("Assign a different random image to each monitor")
-        multi_random_row.set_active(self.config.get_bool('multi_random'))
-        multi_random_row.connect('notify::active', self._on_multi_random_toggled)
-        random_group.add(multi_random_row)
-        self.multi_random_row = multi_random_row
+        random_group.add(row)
+
+        multi_row = gtk['Adw'].SwitchRow.new()
+        multi_row.set_title("Multi‑monitor Random")
+        multi_row.set_subtitle("Assign a different random image to each monitor")
+        multi_row.set_active(self.config.get_bool('multi_random'))
+        multi_row.connect('notify::active', self._on_multi_random_toggled)
+        random_group.add(multi_row)
+        self.multi_random_row = multi_row
+
         self.random_daemon_switch = gtk['Adw'].SwitchRow.new()
         self.random_daemon_switch.set_title("Control")
         self.random_daemon_switch.set_subtitle("Start or stop the random rotation daemon")
         self.random_daemon_switch.set_active(False)
         self.random_daemon_switch.connect('notify::active', self._on_random_daemon_toggled)
         random_group.add(self.random_daemon_switch)
+
         refresh_group = gtk['Adw'].PreferencesGroup.new()
-        refresh_group.set_title("Periodic Refresh")
-        rotation_page.add(refresh_group)
-        refresh_interval_row, self.refresh_spin = create_spin_row(
+        refresh_group.set_title("  Periodic Refresh")
+        page.add(refresh_group)
+        row, self.refresh_spin = create_spin_row(
             "Interval (minutes)", "How often to re‑apply the wallpaper (fixes blur)",
             1, 1440, 1, self.config.get_int('refresh_interval'),
-            self._on_refresh_interval_changed
+            self._on_refresh_interval_changed,
         )
-        refresh_group.add(refresh_interval_row)
-        assert self.random_spin is not None, "Random spin not created"
-        assert self.refresh_spin is not None, "Refresh spin not created"
+        refresh_group.add(row)
 
-    def _build_status_page(self, gtk: dict[str, object]) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        status_page = gtk['Adw'].PreferencesPage.new()
-        status_page.set_title("Status")
-        status_page.set_icon_name("dialog-information-symbolic")
-        self.add(status_page)
-        self.status_page = status_page
-        status_group = gtk['Adw'].PreferencesGroup.new()
-        status_group.set_title("Status")
-        status_group.set_description("Ultraspan system status")
-        status_page.add(status_group)
+    def _build_status_page(self, gtk) -> None:
+        page = gtk['Adw'].PreferencesPage.new()
+        page.set_title("  Status")
+        page.set_icon_name("dialog-information-symbolic")
+        self.add(page)
+        self.status_page = page
+        group = gtk['Adw'].PreferencesGroup.new()
+        group.set_title("  Status")
+        group.set_description("  Ultraspan system status")
+        page.add(group)
         self.status_label = gtk['Gtk'].Label.new("Loading...")
         self.status_label.set_halign(gtk['Gtk'].Align.START)
-        self.status_label.set_valign(gtk['Gtk'].Align.START)
         self.status_label.set_margin_start(12)
         self.status_label.set_margin_end(12)
         self.status_label.set_margin_top(12)
         self.status_label.set_margin_bottom(12)
         self.status_label.set_wrap(True)
-        status_group.add(self.status_label)
-        assert self.status_page is not None, "Status page not created"
-        assert self.status_label is not None, "Status label not created"
+        group.add(self.status_label)
 
-    def _build_custom_background_section(self, gtk: dict[str, object], page: object) -> None:
-        assert isinstance(gtk, dict), "gtk must be dict"
-        assert page is not None, "Page cannot be None"
-
+    def _build_custom_background_section(self, gtk, page) -> None:
         group = gtk['Adw'].PreferencesGroup.new()
-        group.set_title("Custom Background")
-        group.set_description("Optional skin for this settings window")
+        group.set_title("  Custom Background")
+        group.set_description("  Optional skin for this settings window")
         page.add(group)
-
-        # Choose image button (Pro-tip Box wrapper)
-        button_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.VERTICAL, 0)
-        button_box.set_margin_top(16)
-        button_box.set_margin_bottom(16)
 
         choose_bg_btn = gtk['Gtk'].Button.new_with_label("Choose menu background image")
         choose_bg_btn.set_halign(gtk['Gtk'].Align.FILL)
         choose_bg_btn.set_hexpand(True)
+        choose_bg_btn.set_margin_top(16)
+        choose_bg_btn.set_margin_bottom(16)
         choose_bg_btn.connect('clicked', self._on_choose_gui_background_clicked)
-        
-        button_box.append(choose_bg_btn)
-        group.add(button_box)
-        self._choose_gui_bg_btn = choose_bg_btn
+        group.add(choose_bg_btn)
 
-        # Font color picker
-        font_color_row = gtk['Adw'].ActionRow.new()
-        font_color_row.set_title("Font color picker")
-        font_color_row.set_subtitle("Text color for titles and subtitles (picker)")
-        font_color_btn = self._create_color_button(self.config.get('gui_font_color'), self._on_gui_font_color_changed)
-        font_color_row.add_suffix(font_color_btn)
-        font_color_row.set_activatable_widget(font_color_btn)
-        group.add(font_color_row)
-        self._gui_font_color_btn = font_color_btn
+        font_row = gtk['Adw'].ActionRow.new()
+        font_row.set_title("Font color picker")
+        font_row.set_subtitle("Text color for titles and subtitles (picker)")
+        font_btn = self._create_color_button(self.config.get('gui_font_color'), self._on_gui_font_color_changed)
+        font_row.add_suffix(font_btn)
+        font_row.set_activatable_widget(font_btn)
+        group.add(font_row)
+        self._gui_font_color_btn = font_btn
 
-        # Button color picker
-        button_color_row = gtk['Adw'].ActionRow.new()
-        button_color_row.set_title("Button color")
-        button_color_row.set_subtitle("Button background when custom background is active")
-        button_color_btn = self._create_color_button(self.config.get('gui_button_color'), self._on_gui_button_color_changed)
-        button_color_row.add_suffix(button_color_btn)
-        button_color_row.set_activatable_widget(button_color_btn)
-        group.add(button_color_row)
-        self._gui_button_color_btn = button_color_btn
+        button_row = gtk['Adw'].ActionRow.new()
+        button_row.set_title("Button color")
+        button_row.set_subtitle("Button background when custom background is active")
+        button_btn = self._create_color_button(self.config.get('gui_button_color'), self._on_gui_button_color_changed)
+        button_row.add_suffix(button_btn)
+        button_row.set_activatable_widget(button_btn)
+        group.add(button_row)
+        self._gui_button_color_btn = button_btn
 
-        # Group overlay opacity slider
         opacity_row = gtk['Adw'].ActionRow.new()
         opacity_row.set_title("Group overlay opacity")
         opacity_row.set_subtitle("Darken group backgrounds for readability")
-        group_opacity_scale = gtk['Gtk'].Scale.new_with_range(gtk['Gtk'].Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
-        group_opacity_scale.set_value(float(self.config.get('gui_group_opacity') or '0'))
-        group_opacity_scale.set_hexpand(True)
-        group_opacity_scale.connect('value-changed', self._on_gui_group_opacity_changed)
-        opacity_row.add_suffix(group_opacity_scale)
-        opacity_row.set_activatable_widget(group_opacity_scale)
+        opacity_scale = gtk['Gtk'].Scale.new_with_range(gtk['Gtk'].Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
+        opacity_scale.set_value(float(self.config.get('gui_group_opacity') or '0'))
+        opacity_scale.set_hexpand(True)
+        opacity_scale.connect('value-changed', self._on_gui_group_opacity_changed)
+        opacity_row.add_suffix(opacity_scale)
+        opacity_row.set_activatable_widget(opacity_scale)
         group.add(opacity_row)
-        self._gui_group_opacity_scale = group_opacity_scale
+        self._gui_group_opacity_scale = opacity_scale
 
-        # Toggle at the bottom
         self._gui_bg_switch = gtk['Adw'].SwitchRow.new()
         self._gui_bg_switch.set_title("Use custom background")
         self._gui_bg_switch.set_subtitle("Apply the selected image, colors, or group background")
@@ -701,142 +856,264 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         group.add(self._gui_bg_switch)
 
     # ------------------------------------------------------------------
-    # Helper methods 
+    # Mode toggle and grid filter
     # ------------------------------------------------------------------
-    def _on_child_clicked(self, gesture: object, n_press: int, x: float, y: float, child: object) -> None:
-        assert child is not None, "Child cannot be None"
-        assert isinstance(child, Gtk.FlowBoxChild), "Invalid child type"
-        for i, slot_child in enumerate(self.selected_slots):
-            if slot_child == child:
-                self.selected_slots[i] = None
+    def _on_wallpaper_mode_toggled(self, btn) -> None:
+        if not btn.get_active():
+            return
+        # Move the suggested-action class to whichever toggle is active.
+        for b in (self.mode_wallpaper_btn, self.mode_per_monitor_btn, self.mode_video_btn):
+            if b.get_active():
+                b.add_css_class("suggested-action")
+            else:
+                b.remove_css_class("suggested-action")
+        self._apply_grid_filter()
+        self._refresh_selection_highlight()
+
+    def _apply_grid_filter(self) -> None:
+        mode = self._current_mode()
+        child = self.wallpaper_flowbox.get_first_child()
+        while child is not None:
+            is_vid = getattr(child, 'is_video', False)
+            if mode == 'video':
+                child.set_visible(is_vid)
+            else:
+                # Wallpaper and Per-Monitor show everything.
+                child.set_visible(True)
+            child = child.get_next_sibling()
+
+    def _refresh_selection_highlight(self) -> None:
+        # Clear selection CSS on every child first.
+        child = self.wallpaper_flowbox.get_first_child()
+        while child is not None:
+            child.remove_css_class('selected')
+            if hasattr(child, 'badge_label'):
+                child.badge_label.set_visible(False)
+                child.badge_label.set_text("")
+            child = child.get_next_sibling()
+        # Re-apply for the current mode.
+        mode = self._current_mode()
+        if mode == 'wallpaper':
+            if self.wallpaper_selection is not None:
+                self.wallpaper_selection.add_css_class('selected')
+        elif mode == 'per_monitor':
+            for i, slot_child in enumerate(self.per_monitor_slots):
+                if slot_child is not None:
+                    slot_child.add_css_class('selected')
+                    if hasattr(slot_child, 'badge_label'):
+                        slot_child.badge_label.set_text(str(i + 1))
+                        slot_child.badge_label.set_visible(True)
+        elif mode == 'video':
+            for c in self.video_selections:
+                c.add_css_class('selected')
+                if hasattr(c, 'badge_label'):
+                    c.badge_label.set_text(str(c.assigned_monitor + 1))
+                    c.badge_label.set_visible(True)
+
+    # ------------------------------------------------------------------
+    # Selection click handling
+    # ------------------------------------------------------------------
+    def _on_child_clicked(self, gesture, n_press, x, y, child) -> None:
+        mode = self._current_mode()
+        if mode == 'wallpaper':
+            self._handle_single_click(child)
+        elif mode == 'per_monitor':
+            self._handle_slot_click(child, self.per_monitor_slots)
+        elif mode == 'video':
+            self._handle_video_click(child)
+
+    def _handle_single_click(self, child) -> None:
+        if self.wallpaper_selection is child:
+            self.wallpaper_selection = None
+            child.remove_css_class('selected')
+            return
+        if self.wallpaper_selection is not None:
+            self.wallpaper_selection.remove_css_class('selected')
+        self.wallpaper_selection = child
+        child.add_css_class('selected')
+
+    def _handle_slot_click(self, child, slots) -> None:
+        # Deselect if already in a slot.
+        for i, c in enumerate(slots):
+            if c is child:
+                slots[i] = None
                 child.remove_css_class('selected')
                 if hasattr(child, 'badge_label'):
                     child.badge_label.set_visible(False)
                     child.badge_label.set_text("")
                 return
-        if self.mode_single_btn.get_active():
-            old_child = self.selected_slots[0] if self.selected_slots else None
-            if old_child is not None:
-                old_child.remove_css_class('selected')
-                if hasattr(old_child, 'badge_label'):
-                    old_child.badge_label.set_visible(False)
-                    old_child.badge_label.set_text("")
-            self.selected_slots[0] = child
-            child.add_css_class('selected')
+        try:
+            slot = slots.index(None)
+        except ValueError:
+            return
+        if sum(1 for s in slots if s is not None) >= self._get_current_max_allowed():
+            return
+        slots[slot] = child
+        child.add_css_class('selected')
+        if hasattr(child, 'badge_label'):
+            child.badge_label.set_text(str(slot + 1))
+            child.badge_label.set_visible(True)
+
+    def _handle_video_click(self, child) -> None:
+        # Deselect if already selected.
+        if child in self.video_selections:
+            self.video_selections.remove(child)
+            child.remove_css_class('selected')
             if hasattr(child, 'badge_label'):
                 child.badge_label.set_visible(False)
                 child.badge_label.set_text("")
             return
-        max_allowed = self._get_current_max_allowed()
-        try:
-            slot_index = self.selected_slots.index(None)
-        except ValueError:
+        if len(self.video_selections) >= self.monitor_count:
             return
-        filled_count = sum(1 for s in self.selected_slots if s is not None)
-        if filled_count >= max_allowed:
+        used = {c.assigned_monitor for c in self.video_selections}
+        free = next((i for i in range(self.monitor_count) if i not in used), None)
+        if free is None:
             return
-        self.selected_slots[slot_index] = child
+        child.assigned_monitor = free
+        self.video_selections.append(child)
         child.add_css_class('selected')
         if hasattr(child, 'badge_label'):
-            child.badge_label.set_text(str(slot_index + 1))
+            child.badge_label.set_text(str(free + 1))
             child.badge_label.set_visible(True)
 
-    def _on_child_key_pressed(self, controller: object, keyval: int, keycode: int, state: object, child: object) -> bool:
+    def _handle_badge_click(self, gesture, n_press, x, y, child) -> None:
+        mode = self._current_mode()
+        if mode == 'video':
+            used = {c.assigned_monitor for c in self.video_selections if c is not child}
+            if self.monitor_count == 0:
+                return
+            nxt = (child.assigned_monitor + 1) % self.monitor_count
+            # Skip monitors taken by other selected videos.
+            for _ in range(self.monitor_count):
+                if nxt not in used:
+                    break
+                nxt = (nxt + 1) % self.monitor_count
+            child.assigned_monitor = nxt
+            child.badge_label.set_text(str(nxt + 1))
+        else:
+            self._on_child_clicked(None, 0, 0, 0, child)
+        gesture.set_state(GTK['Gtk'].EventSequenceState.CLAIMED)
+
+    def _on_child_key_pressed(self, controller, keyval, keycode, state, child) -> bool:
         gtk = GTK
-        assert child is not None, "Child cannot be None"
-        assert isinstance(keyval, int), "keyval must be int"
         if keyval in (gtk['Gdk'].KEY_Return, gtk['Gdk'].KEY_KP_Enter, gtk['Gdk'].KEY_space):
             self._on_child_clicked(None, 0, 0, 0, child)
             return True
         return False
 
-    def _get_index(self, model: object, val: str) -> int:
-        assert model is not None, "Model cannot be None"
-        assert isinstance(val, str), "Value must be string"
-        for i in range(model.get_n_items()):
-            if model.get_string(i) == val:
-                return i
-        return 0
+    # ------------------------------------------------------------------
+    # Apply
+    # ------------------------------------------------------------------
+    def _on_apply_clicked(self, btn) -> None:
+        mode = self._current_mode()
+        config_mode = self.config.get('mode')
+        cmd_list = []
 
-    def _run_ultraspan(self, args: list[str]) -> tuple[str, str, int]:
-        assert isinstance(args, list), "args must be list"
-        assert all(isinstance(a, str) for a in args), "args must contain strings"
-        try:
-            result = subprocess.run(
-                [SCRIPT_PATH] + args,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False
-            )
-            return result.stdout.strip(), result.stderr.strip(), result.returncode
-        except subprocess.TimeoutExpired as e:
-            return "", str(e), 1
-        except FileNotFoundError as e:
-            return "", str(e), 1
-        except OSError as e:
-            return "", str(e), 1
+        if mode == 'wallpaper':
+            if self.wallpaper_selection is None:
+                return
+            path = getattr(self.wallpaper_selection, 'path', None)
+            if not path:
+                return
+            if is_video_path(path):
+                # Full-span video. Doesn't touch the underlying wallpaper.
+                cmd_list.append(["set-video", path])
+            else:
+                # Image: kill any running video, then set the image.
+                cmd_list.append(["stop-video"])
+                cmd_list.append(["set", path, config_mode])
 
-    def _run_ultraspan_async(self, args: list[str]) -> None:
-        assert isinstance(args, list), "args must be list"
-        assert all(isinstance(a, str) for a in args), "args must contain strings"
-        def runner() -> None:
-            self._run_ultraspan(args)
-        threading.Thread(target=runner, daemon=True).start()
+        elif mode == 'per_monitor':
+            slot_paths = []
+            for child in self.per_monitor_slots:
+                if child is None:
+                    slot_paths.append("none")
+                else:
+                    p = getattr(child, 'path', None)
+                    slot_paths.append(p if p else "none")
+            if all(p == "none" for p in slot_paths):
+                return
+            # set-media stops any running video and rebuilds the mixed canvas.
+            cmd_list.append(["set-media"] + slot_paths)
 
+        elif mode == 'video':
+            if not self.video_selections:
+                return
+            pairs = []
+            for c in self.video_selections:
+                p = getattr(c, 'path', None)
+                if p:
+                    pairs.append(f"{c.assigned_monitor}:{p}")
+            if not pairs:
+                return
+            cmd_list.append(["set-video-on"] + pairs)
+
+        if not cmd_list:
+            return
+
+        def run() -> None:
+            for cmd in cmd_list:
+                self._run_ultraspan(cmd)
+
+        threading.Thread(target=run, daemon=True).start()
+        btn.set_label("Applied!")
+        GTK['GLib'].timeout_add(1500, lambda: btn.set_label("Apply"))
+
+    # ------------------------------------------------------------------
+    # Populate grid
+    # ------------------------------------------------------------------
     def _populate_wallpaper_list_async(self) -> None:
         gtk = GTK
-        assert self.wallpaper_flowbox is not None, "FlowBox not initialised"
-        assert isinstance(self.config, UltraspanConfig), "Config invalid"
         folder = self.config.get('wallpaper_folder')
         if not os.path.isdir(folder):
             return
         try:
-            files = sorted([f for f in os.listdir(folder)
-                            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))])
+            files = sorted([f for f in os.listdir(folder) if f.lower().endswith(ALL_EXTENSIONS)])
         except OSError:
             files = []
-        # bounded loop: safety max 10000 children
-        for _ in range(10000):
-            child = self.wallpaper_flowbox.get_first_child()
-            if child is None:
-                break
+
+        # Clear existing.
+        child = self.wallpaper_flowbox.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
             self.wallpaper_flowbox.remove(child)
+            child = nxt
+
+        # Clearing the grid invalidates any selection state.
+        self.wallpaper_selection = None
+        self.per_monitor_slots = [None] * self.monitor_count
+        self.video_selections = []
+
         if not files:
             return
-        self._image_paths = [os.path.join(folder, f) for f in files]
+        paths = [os.path.join(folder, f) for f in files]
 
-        def load_thumbnails() -> None:
-            for idx, path in enumerate(self._image_paths):
-                thumb_path = get_thumbnail_path(path, size=134)
-                if os.path.exists(thumb_path):
-                    try:
-                        pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
-                    except gtk['GLib'].Error:
-                        continue
-                else:
-                    try:
-                        pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file_at_scale(path, 134, 134, True)
-                        pixbuf.savev(thumb_path, 'png', [], [])
-                    except (gtk['GLib'].Error, OSError):
-                        continue
-                gtk['GLib'].idle_add(self._add_thumbnail_to_flowbox, path, pixbuf, idx)
+        def load() -> None:
+            for idx, path in enumerate(paths):
+                try:
+                    pixbuf = build_media_pixbuf(gtk, path)
+                except Exception as e:
+                    print(f"[thumb] fatal: {path}: {e}", file=sys.stderr)
+                    continue
+                gtk['GLib'].idle_add(self._add_thumbnail_to_flowbox, path, pixbuf)
 
-        threading.Thread(target=load_thumbnails, daemon=True).start()
+        threading.Thread(target=load, daemon=True).start()
 
-    def _add_thumbnail_to_flowbox(self, path: str, pixbuf: object, idx: int) -> None:
+    def _add_thumbnail_to_flowbox(self, path: str, pixbuf) -> None:
         gtk = GTK
-        assert isinstance(path, str) and path, "Invalid path"
-        assert pixbuf is not None, "Pixbuf cannot be None"
         child = gtk['Gtk'].FlowBoxChild.new()
         child.path = path
+        child.is_video = is_video_path(path)
+        child.assigned_monitor = 0
         child.set_focusable(True)
+
         texture = gtk['Gdk'].Texture.new_for_pixbuf(pixbuf)
         picture = gtk['Gtk'].Picture.new_for_paintable(texture)
         picture.set_can_shrink(True)
         picture.set_size_request(134, 134)
         picture.set_halign(gtk['Gtk'].Align.CENTER)
         picture.set_valign(gtk['Gtk'].Align.START)
+
         badge = gtk['Gtk'].Label.new("")
         badge.set_halign(gtk['Gtk'].Align.START)
         badge.set_valign(gtk['Gtk'].Align.START)
@@ -844,17 +1121,28 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         badge.set_margin_top(2)
         badge.add_css_class("badge")
         badge.set_visible(False)
+
         overlay = gtk['Gtk'].Overlay.new()
         overlay.set_valign(gtk['Gtk'].Align.START)
         overlay.set_halign(gtk['Gtk'].Align.CENTER)
         overlay.set_child(picture)
         overlay.add_overlay(badge)
+
+        if child.is_video:
+            vid_tag = gtk['Gtk'].Label.new("VIDEO")
+            vid_tag.set_halign(gtk['Gtk'].Align.END)
+            vid_tag.set_valign(gtk['Gtk'].Align.START)
+            vid_tag.set_margin_end(4)
+            vid_tag.set_margin_top(4)
+            vid_tag.add_css_class("video-badge")
+            overlay.add_overlay(vid_tag)
+
         child.badge_label = badge
+
         vbox = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.VERTICAL, 0)
         vbox.set_spacing(0)
         vbox.append(overlay)
-        fname = os.path.basename(path)
-        label = gtk['Gtk'].Label.new(fname)
+        label = gtk['Gtk'].Label.new(os.path.basename(path))
         label.set_xalign(0.5)
         label.set_valign(gtk['Gtk'].Align.START)
         label.set_wrap(True)
@@ -862,16 +1150,71 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         label.set_ellipsize(3)
         vbox.append(label)
         child.set_child(vbox)
+
+        # Main click gesture on the child.
         click_gesture = gtk['Gtk'].GestureClick.new()
         click_gesture.connect('pressed', self._on_child_clicked, child)
         child.add_controller(click_gesture)
+
+        # Separate gesture on the badge. Capture phase so it wins over the child.
+        badge_gesture = gtk['Gtk'].GestureClick.new()
+        badge_gesture.set_propagation_phase(gtk['Gtk'].PropagationPhase.CAPTURE)
+        badge_gesture.connect('pressed', self._handle_badge_click, child)
+        badge.add_controller(badge_gesture)
+
         key_controller = gtk['Gtk'].EventControllerKey.new()
         key_controller.connect('key-pressed', self._on_child_key_pressed, child)
         child.add_controller(key_controller)
+
         self.wallpaper_flowbox.append(child)
         child.add_css_class('wallpaper-child')
-        assert child.get_parent() is not None, "Thumbnail child not added to flowbox"
 
+        # Apply current mode filter to the new child immediately.
+        mode = self._current_mode()
+        if mode == 'video':
+            child.set_visible(child.is_video)
+        else:
+            child.set_visible(True)
+
+    # ------------------------------------------------------------------
+    # Refresh
+    # ------------------------------------------------------------------
+    def _on_refresh_images_clicked(self, btn) -> None:
+        self._populate_wallpaper_list_async()
+
+    # ------------------------------------------------------------------
+    # Monitor list
+    # ------------------------------------------------------------------
+    def _populate_monitor_list(self) -> None:
+        gtk = GTK
+        for _ in range(1000):
+            child = self.monitor_list_box.get_first_child()
+            if child is None:
+                break
+            self.monitor_list_box.remove(child)
+        try:
+            result = subprocess.run(['xrandr', '--listmonitors'],
+                                    capture_output=True, text=True, timeout=5, check=False)
+            lines = result.stdout.splitlines()
+            monitors = []
+            for line in lines[1:]:
+                parts = line.split()
+                monitors.append(parts[-1] if len(parts) >= 4 else line.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            monitors = []
+        self.monitor_count = len(monitors)
+        self.per_monitor_slots = [None] * self.monitor_count
+        if not monitors:
+            self.monitor_list_box.append(gtk['Gtk'].Label.new("No monitors detected"))
+            return
+        for i, name in enumerate(monitors):
+            lbl = gtk['Gtk'].Label.new(f"{i+1}: {name}")
+            lbl.set_xalign(0.0)
+            self.monitor_list_box.append(lbl)
+
+    # ------------------------------------------------------------------
+    # Autostart
+    # ------------------------------------------------------------------
     def _autostart_file_path(self) -> str:
         return os.path.expanduser('~/.config/autostart/ultraspan-daemon.desktop')
 
@@ -883,24 +1226,16 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             return
         enabled = row.get_active()
         autostart_file = self._autostart_file_path()
-        helper_dir = os.path.expanduser('~/.local/bin')
-        helper_path = os.path.join(helper_dir, 'ultraspan-autostart')
-
+        helper_path = os.path.expanduser('~/.local/bin/ultraspan-autostart')
         if enabled:
             os.makedirs(os.path.dirname(autostart_file), exist_ok=True)
-            os.makedirs(helper_dir, exist_ok=True)
-
-            # Determine ultraspan path
+            os.makedirs(os.path.dirname(helper_path), exist_ok=True)
             script_path = shutil.which('ultraspan') or os.path.expanduser('~/.local/bin/ultraspan')
-
-            # Write helper script
             with open(helper_path, 'w') as f:
                 f.write("#!/bin/bash\n")
                 f.write("sleep 3\n")
                 f.write(f"setsid nohup {script_path} daemon >/dev/null 2>&1 &\n")
             os.chmod(helper_path, 0o755)
-
-            # Write valid autostart entry
             with open(autostart_file, 'w') as f:
                 f.write("[Desktop Entry]\n")
                 f.write("Type=Application\n")
@@ -908,261 +1243,183 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 f.write(f"Exec={helper_path}\n")
                 f.write("X-GNOME-Autostart-enabled=true\n")
         else:
-            try:
-                os.remove(autostart_file)
-            except FileNotFoundError:
-                pass
-            try:
-                os.remove(helper_path)
-            except FileNotFoundError:
-                pass
+            for p in (autostart_file, helper_path):
+                try:
+                    os.remove(p)
+                except FileNotFoundError:
+                    pass
 
     # ------------------------------------------------------------------
-    # Other helper methods
+    # Config signal handlers
     # ------------------------------------------------------------------
-    def _populate_monitor_list(self) -> None:
-        gtk = GTK
-        assert self.monitor_list_box is not None, "Monitor list box not initialised"
-        assert isinstance(self.monitor_list_box, Gtk.Box), "Invalid monitor list box"
-        # bounded loop: safety max 1000
-        for _ in range(1000):
-            child = self.monitor_list_box.get_first_child()
-            if child is None:
-                break
-            self.monitor_list_box.remove(child)
+    def _on_backend_changed(self, row, *args) -> None:
+        val = row.get_model().get_string(row.get_selected())
+        self.config.set('backend', val)
+        self._run_ultraspan_async(["set-config", "backend", val])
+
+    def _on_fullscreen_toggled(self, row, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        val = row.get_active()
+        self.config.set('fullscreen_pause', str(val).lower())
+        self._run_ultraspan_async(["set-config", "fullscreen_pause", str(val).lower()])
+
+    def _on_workspace_toggled(self, row, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        val = row.get_active()
+        self.config.set('per_workspace', str(val).lower())
+        self._run_ultraspan_async(["set-config", "per_workspace", str(val).lower()])
+        if val and not self._is_daemon_running():
+            self._run_ultraspan_async(["daemon"])
+            GTK['GLib'].timeout_add(2500, self._update_service_status)
+
+    def _on_mode_changed(self, row, *args) -> None:
+        val = row.get_model().get_string(row.get_selected())
+        self.config.set('mode', val)
+        self._run_ultraspan_async(["mode", val])
+
+    def _on_bg_type_changed(self, row, *args) -> None:
+        val = row.get_model().get_string(row.get_selected())
+        self.config.set('bg_type', val)
+        self._run_ultraspan_async(["bg-type", val])
+
+    def _on_blur_changed(self, scale, *args) -> None:
+        val = int(scale.get_value())
+        self.config.set('blur', str(val))
+        self._run_ultraspan_async(["blur", str(val)])
+
+    def _on_color_changed(self, btn, *args) -> None:
+        color = btn.props.rgba.to_string()
+        self.config.set('color', color)
+        self._run_ultraspan_async(["color", color])
+
+    def _on_fullscreen_grace_changed(self, spin, *args) -> None:
+        val = int(spin.get_value())
+        self.config.set('fullscreen_grace_seconds', str(val))
+        self._run_ultraspan_async(["set-config", "fullscreen_grace_seconds", str(val)])
+
+    def _on_click_relower_toggled(self, row, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        val = row.get_active()
         try:
-            result = subprocess.run(
-                ['xrandr', '--listmonitors'],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False
-            )
-            lines = result.stdout.splitlines()
-            monitors = []
-            for line in lines[1:]:
-                parts = line.split()
-                if len(parts) >= 4:
-                    name = parts[-1]
-                    monitors.append(name)
-                else:
-                    monitors.append(line.strip())
-        except (OSError, subprocess.TimeoutExpired):
-            monitors = []
-        self.monitor_count = len(monitors)
-        self.selected_slots = [None] * self.monitor_count
-        if not monitors:
-            label = gtk['Gtk'].Label.new("No monitors detected")
-            self.monitor_list_box.append(label)
-            return
-        for i, name in enumerate(monitors):
-            label = gtk['Gtk'].Label.new(f"{i+1}: {name}")
-            label.set_xalign(0.0)
-            self.monitor_list_box.append(label)
+            write_daemon_config({'click_relower': 'true' if val else 'false'})
+        except OSError as e:
+            print(f"Failed to write daemon config: {e}", file=sys.stderr)
 
-    def _on_mode_toggled(self, btn: object) -> None:
+    def _on_choose_folder_clicked(self, btn) -> None:
         gtk = GTK
-        assert btn is not None, "Button cannot be None"
-        assert isinstance(btn, Gtk.ToggleButton), "Invalid button type"
-        if self._updating_modes:
-            return
-        if not btn.get_active():
-            return
-        self._updating_modes = True
-        self.mode_single_btn.set_active(False)
-        self.mode_per_monitor_btn.set_active(False)
-        btn.set_active(True)
-        max_allowed = self._get_current_max_allowed()
-        self.selected_slots = [None] * max_allowed
-        next_child = self.wallpaper_flowbox.get_first_child()
-        while next_child:
-            child = next_child
-            next_child = child.get_next_sibling()
-            child.remove_css_class('selected')
-            if hasattr(child, 'badge_label'):
-                child.badge_label.set_visible(False)
-                child.badge_label.set_text("")
-        for b in (self.mode_single_btn, self.mode_per_monitor_btn):
-            if b.get_active():
-                b.add_css_class("suggested-action")
-            else:
-                b.remove_css_class("suggested-action")
-        self.wallpaper_flowbox.set_selection_mode(gtk['Gtk'].SelectionMode.NONE)
-        self._updating_modes = False
+        dialog = gtk['Gtk'].FileDialog.new()
+        dialog.set_title("Select Wallpaper Folder")
+        dialog.select_folder(self, None, self._on_folder_dialog_response)
 
-    def _on_apply_clicked(self, btn: object) -> None:
-        assert btn is not None, "Button cannot be None"
-        assert isinstance(btn, Gtk.Button), "Invalid button type"
-
-        selected_children = [child for child in self.selected_slots if child is not None]
-        if not selected_children:
-            return
-
-        paths = [getattr(child, 'path', None) for child in selected_children if getattr(child, 'path', None)]
-        if not paths:
-            return
-
-        mode = self.config.get('mode')
-        cmd = []
-
-        if self.mode_single_btn.get_active() and len(paths) >= 1:
-            cmd = ["set", paths[0], mode]
-        elif self.mode_per_monitor_btn.get_active() and len(paths) >= 1:
-            cmd = ["set-per-monitor"] + paths + [mode]
-
-        if cmd:
-            self._run_ultraspan_async(cmd)
-            btn.set_label("Applied!")
-            gtk = GTK
-            gtk['GLib'].timeout_add(1500, lambda: btn.set_label("Apply"))
-
-    def _on_multiple_files_selected(self, dialog: object, result: object) -> None:
-        gtk = GTK
-        assert dialog is not None, "Dialog cannot be None"
-        assert result is not None, "Result cannot be None"
+    def _on_open_folder_clicked(self, btn) -> None:
+        folder = self.config.get('wallpaper_folder')
+        if not os.path.isdir(folder):
+            os.makedirs(folder, exist_ok=True)
         try:
-            files = dialog.select_multiple_finish(result)
+            uri = GLib.filename_to_uri(folder)
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except (GLib.Error, OSError) as e:
+            print(f"Error opening folder: {e}", file=sys.stderr)
+
+    def _on_folder_dialog_response(self, dialog, result) -> None:
+        gtk = GTK
+        try:
+            folder = dialog.select_folder_finish(result)
         except gtk['GLib'].Error:
             return
-        if not files:
-            return
-        paths = []
-        n = files.get_n_items()
-        for i in range(n):
-            gfile = files.get_item(i)
-            if gfile:
-                paths.append(gfile.get_path())
-        if not paths:
-            return
-        mode = self.config.get('mode')
-        self._run_ultraspan_async(["set-per-monitor"] + paths + [mode])
-
-    def _on_single_file_for_monitor_selected(self, dialog: object, result: object) -> None:
-        gtk = GTK
-        assert dialog is not None, "Dialog cannot be None"
-        assert result is not None, "Result cannot be None"
-        try:
-            gfile = dialog.select_file_finish(result)
-        except gtk['GLib'].Error:
-            return
-        if gfile:
-            mode = self.config.get('mode')
-            self._run_ultraspan_async(["set", gfile.get_path(), mode])
-
-    def _update_all_widgets(self, *args: object) -> None:
-        gtk = GTK
-        assert isinstance(self.config, UltraspanConfig), "Config invalid"
-        self._updating_widgets = True
-        try:
-            self.config.load()
-            assert hasattr(self, 'backend_row'), "backend_row not created"
-            self.backend_row.set_selected(self._get_index(self.backend_row.get_model(), self.config.get('backend')))
-            new_fullscreen = self.config.get_bool('fullscreen_pause')
-            if self.fullscreen_row.get_active() != new_fullscreen:
-                self.fullscreen_row.set_active(new_fullscreen)
-
-            # Sync custom background controls
-            if hasattr(self, '_gui_bg_switch') and self._gui_bg_switch is not None:
-                skin_enabled = self.config.get_bool('gui_skin_enabled')
-                if self._gui_bg_switch.get_active() != skin_enabled:
-                    self._gui_bg_switch.set_active(skin_enabled)
-                self._apply_gui_background()
-
-            # Sync font/button color buttons
-            if hasattr(self, '_gui_font_color_btn') and self._gui_font_color_btn is not None:
-                rgba = gtk['Gdk'].RGBA()
-                rgba.parse(self.config.get('gui_font_color') or '#000000')
-                self._gui_font_color_btn.props.rgba = rgba
-
-            if hasattr(self, '_gui_button_color_btn') and self._gui_button_color_btn is not None:
-                rgba = gtk['Gdk'].RGBA()
-                rgba.parse(self.config.get('gui_button_color') or '#000000')
-                self._gui_button_color_btn.props.rgba = rgba
-
-            if self._autostart_daemon_switch is not None:
-                autostart_enabled = self._is_autostart_enabled()
-                if self._autostart_daemon_switch.get_active() != autostart_enabled:
-                    self._autostart_daemon_switch.set_active(autostart_enabled)
-
-            if hasattr(self, '_gui_group_opacity_scale') and self._gui_group_opacity_scale is not None:
-                new_opacity = float(self.config.get('gui_group_opacity') or '0')
-                if abs(self._gui_group_opacity_scale.get_value() - new_opacity) > 0.001:
-                    self._gui_group_opacity_scale.set_value(new_opacity)
-
-            new_workspace = self.config.get_bool('per_workspace')
-            if self.workspace_row.get_active() != new_workspace:
-                self.workspace_row.set_active(new_workspace)
-            self.mode_row.set_selected(self._get_index(self.mode_row.get_model(), self.config.get('mode')))
-            self.bg_type_row.set_selected(self._get_index(self.bg_type_row.get_model(), self.config.get('bg_type')))
-            self.blur_scale.set_value(self.config.get_int('blur'))
-            rgba = gtk['Gdk'].RGBA()
-            color_str = self.config.get('color')
-            rgba.parse(color_str if color_str else '#000000')
-            self.color_btn.props.rgba = rgba
-            self.folder_button.set_label(self.config.get('wallpaper_folder'))
+        if folder:
+            path = folder.get_path()
+            self.folder_button.set_label(path)
+            self.config.set('wallpaper_folder', path)
+            self._run_ultraspan_async(["set-config", "wallpaper_folder", path])
             self._populate_wallpaper_list_async()
-            self.random_spin.set_value(self.config.get_int('random_interval'))
-            new_multi_random = self.config.get_bool('multi_random')
-            if self.multi_random_row.get_active() != new_multi_random:
-                self.multi_random_row.set_active(new_multi_random)
-            self.refresh_spin.set_value(self.config.get_int('refresh_interval'))
-            self._update_service_status()
-        finally:
-            self._updating_widgets = False
 
-    def _create_color_button(self, current_hex: str, callback) -> object:
-        gtk = GTK
-        rgba = gtk['Gdk'].RGBA()
-        rgba.parse(current_hex if current_hex else '#000000')
-        dialog = gtk['Gtk'].ColorDialog.new()
-        dialog.set_title("Choose color")
-        btn = gtk['Gtk'].ColorDialogButton.new(dialog)
-        btn.props.rgba = rgba
-        btn.set_size_request(24, 24)
-        btn.set_halign(gtk['Gtk'].Align.CENTER)
-        btn.set_valign(gtk['Gtk'].Align.CENTER)
-        btn.connect('notify::rgba', callback)
-        return btn
+    def _on_random_interval_changed(self, spin, *args) -> None:
+        val = int(spin.get_value())
+        self.config.set('random_interval', str(val))
+        self._run_ultraspan_async(["interval", str(val)])
 
-    def _on_choose_gui_background_clicked(self, btn: object) -> None:
-        assert btn is not None, "Button cannot be None"
+    def _on_multi_random_toggled(self, row, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        val = row.get_active()
+        self.config.set('multi_random', str(val).lower())
+        self._run_ultraspan_async(["set-config", "multi_random", str(val).lower()])
+
+    def _on_refresh_interval_changed(self, spin, *args) -> None:
+        val = int(spin.get_value())
+        self.config.set('refresh_interval', str(val))
+        self._run_ultraspan_async(["set-config", "refresh_interval", str(val)])
+
+    def _on_random_daemon_toggled(self, switch, *args) -> None:
+        active = switch.get_active()
+        if active:
+            folder = self.config.get('wallpaper_folder')
+            mode = self.config.get('mode')
+            cmd = "random-multi" if self.config.get_bool('multi_random') else "random"
+            self._run_ultraspan_async([cmd, folder, mode])
+        else:
+            self._run_ultraspan_async(["random-stop"])
+        GTK['GLib'].timeout_add(500, self._update_service_status)
+
+    def _update_service_status(self) -> None:
+        random_running = os.path.exists(RANDOM_FILE)
+        daemon_running = self._is_daemon_running()
+        self.random_daemon_switch.set_active(random_running)
+        if hasattr(self, 'daemon_switch'):
+            self.daemon_switch.set_active(daemon_running)
+
+    def _on_daemon_toggled(self, row, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        val = row.get_active()
+        self._run_ultraspan_async(["daemon"] if val else ["daemon-stop"])
+        GTK['GLib'].timeout_add(2000, self._update_service_status)
+        GTK['GLib'].timeout_add(5000, self._update_service_status)
+
+    def _on_gui_group_opacity_changed(self, scale, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        self.config.set('gui_group_opacity', str(scale.get_value()))
+        self._apply_gui_background()
+
+    def _on_choose_gui_background_clicked(self, btn) -> None:
         gtk = GTK
         dialog = gtk['Gtk'].FileDialog.new()
         dialog.set_title("Select Background Image")
         dialog.open(self, None, self._on_gui_background_file_response)
 
-    def _on_gui_background_file_response(self, dialog: object, result: object) -> None:
+    def _on_gui_background_file_response(self, dialog, result) -> None:
         gtk = GTK
         try:
             file = dialog.open_finish(result)
         except gtk['GLib'].Error:
             return
         if file:
-            path = file.get_path()
-            self.config.set('gui_background', path)
+            self.config.set('gui_background', file.get_path())
             self._apply_gui_background()
             if hasattr(self, '_gui_bg_switch'):
                 self._gui_bg_switch.set_active(True)
 
-    def _on_gui_background_toggled(self, row: object, *args: object) -> None:
+    def _on_gui_background_toggled(self, row, *args) -> None:
         if getattr(self, '_updating_widgets', False):
             return
-        enabled = row.get_active()
-        self.config.set('gui_skin_enabled', str(enabled).lower())
+        self.config.set('gui_skin_enabled', str(row.get_active()).lower())
         self._apply_gui_background()
 
-    def _on_gui_font_color_changed(self, btn: object, *args: object) -> None:
+    def _on_gui_font_color_changed(self, btn, *args) -> None:
         if getattr(self, '_updating_widgets', False):
             return
-        rgba = btn.props.rgba
-        self.config.set('gui_font_color', rgba.to_string())
+        self.config.set('gui_font_color', btn.props.rgba.to_string())
         self._apply_gui_background()
 
-    def _on_gui_button_color_changed(self, btn: object, *args: object) -> None:
+    def _on_gui_button_color_changed(self, btn, *args) -> None:
         if getattr(self, '_updating_widgets', False):
             return
-        rgba = btn.props.rgba
-        self.config.set('gui_button_color', rgba.to_string())
+        self.config.set('gui_button_color', btn.props.rgba.to_string())
         self._apply_gui_background()
 
     def _apply_gui_background(self, force_off: bool = False) -> None:
@@ -1178,274 +1435,179 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         button_color = self.config.get('gui_button_color')
         group_opacity = float(self.config.get('gui_group_opacity') or '0')
 
-        css_parts = []
-
+        parts = []
         if bg_image and os.path.isfile(bg_image):
-            css_parts.append(
+            parts.append(
                 'window.ultraspan-window {'
                 f' background-image: url("file://{bg_image}");'
                 ' background-size: cover;'
                 ' background-position: center;'
                 ' }'
             )
-
         if font_color:
-            css_parts.append(
-                f'window.ultraspan-window * {{ color: {font_color}; }}'
-            )
-
+            parts.append(f'window.ultraspan-window * {{ color: {font_color}; }}')
         if button_color:
-            css_parts.append(
-                f'window.ultraspan-window button {{ background-color: {button_color}; }}'
-            )
-
+            parts.append(f'window.ultraspan-window button {{ background-color: {button_color}; }}')
         if group_opacity > 0:
-            css_parts.append(
-                f'window.ultraspan-window preferencesgroup {{ background-color: rgba(0, 0, 0, {group_opacity}); }}'
-            )
+            parts.append(f'window.ultraspan-window preferencesgroup {{ background-color: rgba(0, 0, 0, {group_opacity}); }}')
 
-        if bg_image or font_color or button_color or group_opacity > 0:
+        if parts:
             self.add_css_class('ultraspan-window')
         else:
             self.remove_css_class('ultraspan-window')
 
-        if css_parts:
-            self._background_provider.load_from_data(''.join(css_parts).encode())
-        else:
-            self._background_provider.load_from_data(b'')
+        self._background_provider.load_from_data(''.join(parts).encode() if parts else b'')
 
     # ------------------------------------------------------------------
-    # Signal handlers (unchanged except assertions)
+    # Utilities
     # ------------------------------------------------------------------
-    def _on_backend_changed(self, row: object, *args: object) -> None:
-        assert row is not None, "Row cannot be None"
-        assert isinstance(row, Adw.ComboRow), "Invalid row type"
-        val = row.get_model().get_string(row.get_selected())
-        self.config.set('backend', val)
-        self._run_ultraspan_async(["set-config", "backend", val])
+    def _get_index(self, model, val: str) -> int:
+        for i in range(model.get_n_items()):
+            if model.get_string(i) == val:
+                return i
+        return 0
 
-    def _on_fullscreen_toggled(self, row: object, *args: object) -> None:
-        if getattr(self, '_updating_widgets', False):
-            return
-        assert row is not None, "Row cannot be None"
-        assert isinstance(row, Adw.SwitchRow), "Invalid row type"
-        val = row.get_active()
-        self.config.set('fullscreen_pause', str(val).lower())
-        self._run_ultraspan_async(["set-config", "fullscreen_pause", str(val).lower()])
-
-    def _on_workspace_toggled(self, row: object, *args: object) -> None:
-        if getattr(self, '_updating_widgets', False):
-            return
-        assert row is not None, "Row cannot be None"
-        assert isinstance(row, Adw.SwitchRow), "Invalid row type"
-        val = row.get_active()
-        self.config.set('per_workspace', str(val).lower())
-        self._run_ultraspan_async(["set-config", "per_workspace", str(val).lower()])
-
-    def _on_mode_changed(self, row: object, *args: object) -> None:
-        assert row is not None, "Row cannot be None"
-        assert isinstance(row, Adw.ComboRow), "Invalid row type"
-        val = row.get_model().get_string(row.get_selected())
-        self.config.set('mode', val)
-        self._run_ultraspan_async(["mode", val])
-
-    def _on_bg_type_changed(self, row: object, *args: object) -> None:
-        assert row is not None, "Row cannot be None"
-        assert isinstance(row, Adw.ComboRow), "Invalid row type"
-        val = row.get_model().get_string(row.get_selected())
-        self.config.set('bg_type', val)
-        self._run_ultraspan_async(["bg-type", val])
-
-    def _on_blur_changed(self, scale: object, *args: object) -> None:
-        assert scale is not None, "Scale cannot be None"
-        assert isinstance(scale, Gtk.Scale), "Invalid scale type"
-        val = int(scale.get_value())
-        self.config.set('blur', str(val))
-        self._run_ultraspan_async(["blur", str(val)])
-
-    def _on_color_changed(self, btn: object, *args: object) -> None:
-        assert btn is not None, "Button cannot be None"
-        assert isinstance(btn, Gtk.ColorDialogButton), "Invalid button type"
-        rgba = btn.props.rgba
-        color = rgba.to_string()
-        self.config.set('color', color)
-        self._run_ultraspan_async(["color", color])
-
-    def _on_choose_folder_clicked(self, btn: object) -> None:
-        assert btn is not None, "Button cannot be None"
-        gtk = GTK
-        dialog = gtk['Gtk'].FileDialog.new()
-        dialog.set_title("Select Wallpaper Folder")
-        dialog.select_folder(self, None, self._on_folder_dialog_response)
-
-    def _on_refresh_images_clicked(self, btn: object) -> None:
-        assert btn is not None, "Button cannot be None"
-        self.selected_slots = [None] * self._get_current_max_allowed()
-        child = self.wallpaper_flowbox.get_first_child()
-        while child is not None:
-            child.remove_css_class('selected')
-            if hasattr(child, 'badge_label'):
-                child.badge_label.set_visible(False)
-                child.badge_label.set_text("")
-            child = child.get_next_sibling()
-        self._populate_wallpaper_list_async()
-
-    def _on_open_folder_clicked(self, btn: object) -> None:
-        assert btn is not None, "Button cannot be None"
-        folder = self.config.get('wallpaper_folder')
-        if not os.path.isdir(folder):
-            os.makedirs(folder, exist_ok=True)
-
+    def _run_ultraspan(self, args: list[str]):
         try:
-            uri = GLib.filename_to_uri(folder)
-            success = Gio.AppInfo.launch_default_for_uri(uri, None)
-            if not success:
-                raise OSError("No default application for folders")
-        except (GLib.Error, OSError) as e:
-            print(f"Error opening folder: {e}", file=sys.stderr)
+            result = subprocess.run(
+                [SCRIPT_PATH] + args,
+                capture_output=True, text=True, timeout=120, check=False
+            )
+            return result.stdout.strip(), result.stderr.strip(), result.returncode
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            return "", str(e), 1
 
-    def _on_folder_dialog_response(self, dialog: object, result: object) -> None:
-        assert dialog is not None, "Dialog cannot be None"
-        assert result is not None, "Result cannot be None"
+    def _run_ultraspan_async(self, args: list[str]) -> None:
+        threading.Thread(target=lambda: self._run_ultraspan(args), daemon=True).start()
+
+    def _create_color_button(self, current_hex: str, callback) -> object:
         gtk = GTK
+        rgba = gtk['Gdk'].RGBA()
+        rgba.parse(current_hex if current_hex else '#000000')
+        dialog = gtk['Gtk'].ColorDialog.new()
+        dialog.set_title("Choose color")
+        btn = gtk['Gtk'].ColorDialogButton.new(dialog)
+        btn.props.rgba = rgba
+        btn.set_size_request(24, 24)
+        btn.set_halign(gtk['Gtk'].Align.CENTER)
+        btn.set_valign(gtk['Gtk'].Align.CENTER)
+        btn.set_margin_start(0)
+        btn.set_margin_end(0)
+        btn.connect('notify::rgba', callback)
+        return btn
+
+    # ------------------------------------------------------------------
+    # Widget sync
+    # ------------------------------------------------------------------
+    def _update_all_widgets(self, *args) -> None:
+        gtk = GTK
+        self._updating_widgets = True
         try:
-            folder = dialog.select_folder_finish(result)
-        except gtk['GLib'].Error:
-            return
-        if folder:
-            path = folder.get_path()
-            self.folder_button.set_label(path)
-            self.config.set('wallpaper_folder', path)
-            self._run_ultraspan_async(["set-config", "wallpaper_folder", path])
+            self.config.load()
+            self.backend_row.set_selected(self._get_index(self.backend_row.get_model(), self.config.get('backend')))
+
+            new_fs = self.config.get_bool('fullscreen_pause')
+            if self.fullscreen_row.get_active() != new_fs:
+                self.fullscreen_row.set_active(new_fs)
+
+            if hasattr(self, 'video_grace_spin'):
+                self.video_grace_spin.set_value(self.config.get_int('fullscreen_grace_seconds'))
+
+            if hasattr(self, 'click_relower_row'):
+                daemon_cfg = read_daemon_config()
+                current = daemon_cfg.get('click_relower', 'true').lower() in ('true', 'yes', '1', 'on')
+                if self.click_relower_row.get_active() != current:
+                    self.click_relower_row.set_active(current)
+
+            if hasattr(self, '_gui_bg_switch') and self._gui_bg_switch is not None:
+                skin = self.config.get_bool('gui_skin_enabled')
+                if self._gui_bg_switch.get_active() != skin:
+                    self._gui_bg_switch.set_active(skin)
+                self._apply_gui_background()
+
+            if hasattr(self, '_gui_font_color_btn') and self._gui_font_color_btn is not None:
+                rgba = gtk['Gdk'].RGBA()
+                rgba.parse(self.config.get('gui_font_color') or '#000000')
+                self._gui_font_color_btn.props.rgba = rgba
+
+            if hasattr(self, '_gui_button_color_btn') and self._gui_button_color_btn is not None:
+                rgba = gtk['Gdk'].RGBA()
+                rgba.parse(self.config.get('gui_button_color') or '#000000')
+                self._gui_button_color_btn.props.rgba = rgba
+
+            if self._autostart_daemon_switch is not None:
+                auto = self._is_autostart_enabled()
+                if self._autostart_daemon_switch.get_active() != auto:
+                    self._autostart_daemon_switch.set_active(auto)
+
+            if hasattr(self, '_gui_group_opacity_scale') and self._gui_group_opacity_scale is not None:
+                new_op = float(self.config.get('gui_group_opacity') or '0')
+                if abs(self._gui_group_opacity_scale.get_value() - new_op) > 0.001:
+                    self._gui_group_opacity_scale.set_value(new_op)
+
+            new_ws = self.config.get_bool('per_workspace')
+            if self.workspace_row.get_active() != new_ws:
+                self.workspace_row.set_active(new_ws)
+
+            self.mode_row.set_selected(self._get_index(self.mode_row.get_model(), self.config.get('mode')))
+            self.bg_type_row.set_selected(self._get_index(self.bg_type_row.get_model(), self.config.get('bg_type')))
+            self.blur_scale.set_value(self.config.get_int('blur'))
+
+            rgba = gtk['Gdk'].RGBA()
+            color_str = self.config.get('color')
+            rgba.parse(color_str if color_str else '#000000')
+            self.color_btn.props.rgba = rgba
+
+            self.folder_button.set_label(self.config.get('wallpaper_folder'))
             self._populate_wallpaper_list_async()
 
-    def _on_random_interval_changed(self, spin: object, *args: object) -> None:
-        assert spin is not None, "Spin cannot be None"
-        assert isinstance(spin, Gtk.SpinButton), "Invalid spin type"
-        val = int(spin.get_value())
-        self.config.set('random_interval', str(val))
-        self._run_ultraspan_async(["interval", str(val)])
-
-    def _on_multi_random_toggled(self, row: object, *args: object) -> None:
-        if getattr(self, '_updating_widgets', False):
-            return
-        assert row is not None, "Row cannot be None"
-        assert isinstance(row, Adw.SwitchRow), "Invalid row type"
-        val = row.get_active()
-        self.config.set('multi_random', str(val).lower())
-        self._run_ultraspan_async(["set-config", "multi_random", str(val).lower()])
-
-    def _on_refresh_interval_changed(self, spin: object, *args: object) -> None:
-        assert spin is not None, "Spin cannot be None"
-        assert isinstance(spin, Gtk.SpinButton), "Invalid spin type"
-        val = int(spin.get_value())
-        self.config.set('refresh_interval', str(val))
-        self._run_ultraspan_async(["set-config", "refresh_interval", str(val)])
-
-    def _on_random_daemon_toggled(self, switch: object, *args: object) -> None:
-        assert switch is not None, "Switch cannot be None"
-        assert isinstance(switch, Adw.SwitchRow), "Invalid switch type"
-        active = switch.get_active()
-        gtk = GTK
-        if active:
-            folder = self.config.get('wallpaper_folder')
-            mode = self.config.get('mode')
-            cmd = "random-multi" if self.config.get_bool('multi_random') else "random"
-            self._run_ultraspan_async([cmd, folder, mode])
-        else:
-            self._run_ultraspan_async(["random-stop"])
-        gtk['GLib'].timeout_add(500, self._update_service_status)
-
-    def _update_service_status(self) -> None:
-        random_running = os.path.exists(RANDOM_FILE)
-        daemon_running = self._is_daemon_running()
-        assert hasattr(self, 'random_daemon_switch'), "random_daemon_switch not created"
-        self.random_daemon_switch.set_active(random_running)
-        if hasattr(self, 'daemon_switch'):
-            self.daemon_switch.set_active(daemon_running)
-
-    def _on_daemon_toggled(self, row: object, *args: object) -> None:
-        if getattr(self, '_updating_widgets', False):
-            return
-        assert row is not None, "Row cannot be None"
-        assert isinstance(row, Adw.SwitchRow), "Invalid row type"
-        val = row.get_active()
-        gtk = GTK
-        if val:
-            self._run_ultraspan_async(["daemon"])
-        else:
-            self._run_ultraspan_async(["daemon-stop"])
-        gtk['GLib'].timeout_add(2000, self._update_service_status)
-        gtk['GLib'].timeout_add(5000, self._update_service_status)
-
-    def _on_gui_group_opacity_changed(self, scale: object, *args: object) -> None:
-        if getattr(self, '_updating_widgets', False):
-            return
-        opacity = scale.get_value()
-        self.config.set('gui_group_opacity', str(opacity))
-        self._apply_gui_background()
+            self.random_spin.set_value(self.config.get_int('random_interval'))
+            new_mr = self.config.get_bool('multi_random')
+            if self.multi_random_row.get_active() != new_mr:
+                self.multi_random_row.set_active(new_mr)
+            self.refresh_spin.set_value(self.config.get_int('refresh_interval'))
+            self._update_service_status()
+        finally:
+            self._updating_widgets = False
 
     # ------------------------------------------------------------------
-    # Config monitor
+    # Monitors for config / daemon
     # ------------------------------------------------------------------
     def _monitor_config(self) -> None:
         gtk = GTK
-        def callback(file: object, other: object, event: object, data: object) -> None:
-            if event in (gtk['Gio'].FileMonitorEvent.CHANGED, gtk['Gio'].FileMonitorEvent.CHANGES_DONE_HINT):
+        def cb(file, other, event, data) -> None:
+            if event in (gtk['Gio'].FileMonitorEvent.CHANGED,
+                         gtk['Gio'].FileMonitorEvent.CHANGES_DONE_HINT):
                 gtk['GLib'].idle_add(self._update_all_widgets)
         if os.path.exists(CONFIG_FILE):
-            file = gtk['Gio'].File.new_for_path(CONFIG_FILE)
-            self.monitor = file.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
-            self.monitor.connect('changed', callback)
-            assert self.monitor is not None, "File monitor not created"
+            f = gtk['Gio'].File.new_for_path(CONFIG_FILE)
+            self.monitor = f.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
+            self.monitor.connect('changed', cb)
 
     def _monitor_daemon(self) -> None:
-        """Watch daemon PID file to keep daemon switch in sync."""
         gtk = GTK
         if os.path.exists(DAEMON_PID_FILE):
-            file = gtk['Gio'].File.new_for_path(DAEMON_PID_FILE)
-            self.daemon_monitor = file.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
-            self.daemon_monitor.connect('changed', lambda *args: 
-                gtk['GLib'].idle_add(self._update_service_status))
+            f = gtk['Gio'].File.new_for_path(DAEMON_PID_FILE)
+            self.daemon_monitor = f.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
+            self.daemon_monitor.connect('changed',
+                lambda *a: gtk['GLib'].idle_add(self._update_service_status))
         else:
-            # If file doesn't exist yet, watch the directory
             dir_path = os.path.dirname(DAEMON_PID_FILE)
             if os.path.exists(dir_path):
-                dir_file = gtk['Gio'].File.new_for_path(dir_path)
-                self.daemon_monitor = dir_file.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
-                self.daemon_monitor.connect('changed', lambda *args: 
-                    gtk['GLib'].idle_add(self._update_service_status))
+                f = gtk['Gio'].File.new_for_path(dir_path)
+                self.daemon_monitor = f.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
+                self.daemon_monitor.connect('changed',
+                    lambda *a: gtk['GLib'].idle_add(self._update_service_status))
 
-    # ------------------------------------------------------------------
-    # About dialog
-    # ------------------------------------------------------------------
-    def _show_about(self, *args: object) -> None:
-        gtk = GTK
-        about = gtk['Adw'].AboutWindow.new()
-        assert about is not None, "About window not created"
-        about.set_application_name("Ultraspan")
-        about.set_version("1.0.0")
-        about.set_comments("Multi‑monitor wallpaper manager with blur fix")
-        about.set_license_type(gtk['Gtk'].License.GPL_2_0)
-        about.set_website("https://github.com/hisovereign/Ultraspan")
-        about.set_developers(["hisovereign"])
-        about.set_transient_for(self)
-        about.present()
 
-# ----------------------------------------------------------------------
-# Application
-# ----------------------------------------------------------------------
 class UltraspanApp:
     def __init__(self) -> None:
         gtk = GTK
         self.app = gtk['Adw'].Application.new(APP_ID, gtk['Gio'].ApplicationFlags.FLAGS_NONE)
-        assert self.app is not None, "Application creation failed"
         self.app.connect('activate', self.do_activate)
         self.window = None
-        self._updating_widgets = False
 
-    def do_activate(self, app: object) -> None:
-        assert app is not None, "App cannot be None"
+    def do_activate(self, app) -> None:
         if not self.window:
             self.window = UltraspanWindow(self)
             self.app.add_window(self.window)
@@ -1454,17 +1616,14 @@ class UltraspanApp:
         gtk['GLib'].idle_add(self.window._populate_wallpaper_list_async)
 
     def run(self, args: list[str]) -> int:
-        assert isinstance(args, list), "args must be list"
-        assert all(isinstance(a, str) for a in args), "args must contain strings"
         return self.app.run(args)
 
-# ----------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------
+
 def main() -> int:
     os.makedirs(CONFIG_DIR, exist_ok=True)
     app = UltraspanApp()
     return app.run(sys.argv)
+
 
 if __name__ == '__main__':
     main()
