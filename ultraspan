@@ -668,13 +668,13 @@ _compose_per_monitor_canvas() {
         img_h="$($IM_IDENTIFY -format "%h" "$proc")"
 
         if [[ "$mode" == "zoom" ]]; then
-            $IM_CMD "$canvas" "$proc" -geometry +"${mon_x}"+"${mon_y}" -composite "$canvas"
+            $IM_CMD "$canvas" "$proc" -gravity NorthWest -geometry +"${mon_x}"+"${mon_y}" -composite "$canvas"
         else
             local offset_x=$(( mon_x + (mon_w - img_w) / 2 ))
             local offset_y=$(( mon_y + (mon_h - img_h) / 2 ))
             (( offset_x < mon_x )) && offset_x="$mon_x"
             (( offset_y < mon_y )) && offset_y="$mon_y"
-            $IM_CMD "$canvas" "$proc" -geometry +"${offset_x}+${offset_y}" -composite "$canvas"
+            $IM_CMD "$canvas" "$proc" -gravity NorthWest -geometry +"${offset_x}+${offset_y}" -composite "$canvas"
         fi
         rm -f "$proc"
     done
@@ -801,7 +801,7 @@ set_video_wallpaper() {
     assert_file_exists "$daemon" || { log "ERROR" "Video daemon not found: $daemon"; return 1; }
 
     log "INFO" "Starting video daemon in split mode"
-    "$daemon" --split "$video_file" &
+    "$daemon" --split "$video_file" >/dev/null 2>&1 &
     local pid=$!
     disown
 
@@ -828,7 +828,7 @@ set_video_per_monitor_wallpaper() {
     _ensure_fullscreen_monitor
 
     log "INFO" "Starting video daemon in per-monitor mode with $# video(s)"
-    "$daemon" --per-monitor "$@" &
+    "$daemon" --per-monitor "$@" >/dev/null 2>&1 &
     local pid=$!
     disown
 
@@ -925,7 +925,7 @@ set_video_span_wallpaper() {
     assert_file_exists "$daemon" || { log "ERROR" "Daemon not found: $daemon"; return 1; }
 
     log "INFO" "Launching ${#files[@]} slice(s) via daemon --per-monitor"
-    "$daemon" --per-monitor "${files[@]}" &
+    "$daemon" --per-monitor "${files[@]}" >/dev/null 2>&1 &
     local pid=$!
     disown
     echo "$pid" > "$VIDEO_PID_FILE"
@@ -971,7 +971,7 @@ set_video_on_wallpaper() {
     _ensure_fullscreen_monitor
 
     log "INFO" "Starting daemon with --on ${on_args[*]}"
-    "$daemon" --on "${on_args[@]}" &
+    "$daemon" --on "${on_args[@]}" >/dev/null 2>&1 &
     local pid=$!
     disown
     echo "$pid" > "$VIDEO_PID_FILE"
@@ -1072,16 +1072,39 @@ _build_mixed_canvas() {
             continue
         fi
         local proc_file
+        local proc_file
         proc_file="$(process_image_for_area "$e" "${MONITOR_W[i]}" "${MONITOR_H[i]}" "$mode")" || {
             rm -f "$bg_canvas"
             return 1
         }
-        $IM_CMD "$bg_canvas" "$proc_file" \
-            -geometry +"${MONITOR_X[i]}"+"${MONITOR_Y[i]}" \
-            -composite "$bg_canvas" || {
-            rm -f "$bg_canvas" "$proc_file"
-            return 1
-        }
+        local img_w img_h
+        img_w="$($IM_IDENTIFY -format "%w" "$proc_file")"
+        img_h="$($IM_IDENTIFY -format "%h" "$proc_file")"
+
+        local mon_x="${MONITOR_X[i]}"
+        local mon_y="${MONITOR_Y[i]}"
+        local mon_w="${MONITOR_W[i]}"
+        local mon_h="${MONITOR_H[i]}"
+
+        if [[ "$mode" == "zoom" ]]; then
+            $IM_CMD "$bg_canvas" "$proc_file" -gravity NorthWest \
+                -geometry +"${mon_x}"+"${mon_y}" \
+                -composite "$bg_canvas" || {
+                rm -f "$bg_canvas" "$proc_file"
+                return 1
+            }
+        else
+            local offset_x=$(( mon_x + (mon_w - img_w) / 2 ))
+            local offset_y=$(( mon_y + (mon_h - img_h) / 2 ))
+            (( offset_x < mon_x )) && offset_x="$mon_x"
+            (( offset_y < mon_y )) && offset_y="$mon_y"
+            $IM_CMD "$bg_canvas" "$proc_file" -gravity NorthWest \
+                -geometry +"${offset_x}"+"${offset_y}" \
+                -composite "$bg_canvas" || {
+                rm -f "$bg_canvas" "$proc_file"
+                return 1
+            }
+        fi
         rm -f "$proc_file"
     done
 
@@ -1128,7 +1151,7 @@ set_mixed_media_wallpaper() {
 
     if [[ ${#video_indices[@]} -eq $MONITOR_COUNT ]]; then
         log "INFO" "All entries are videos; using daemon per-monitor mode"
-        "$daemon" --per-monitor "${video_paths[@]}" &
+        "$daemon" --per-monitor "${video_paths[@]}" >/dev/null 2>&1 &
         local pid=$!
         disown
         echo "$pid" > "$VIDEO_PID_FILE"
@@ -1175,7 +1198,7 @@ set_mixed_media_wallpaper() {
     done
 
     log "INFO" "Starting daemon with --on ${on_args[*]}"
-    "$daemon" --on "${on_args[@]}" &
+    "$daemon" --on "${on_args[@]}" >/dev/null 2>&1 &
     local pid=$!
     disown
     echo "$pid" > "$VIDEO_PID_FILE"
@@ -1741,7 +1764,7 @@ stop_daemon() {
 # ----------------------------------------------------------------------
 _diagnose_dependencies() {
     echo "Dependencies:"
-    for cmd in xrandr gsettings md5sum bc feh nitrogen mpv xdotool ffmpeg ffprobe xterm; do
+    for cmd in xrandr gsettings md5sum bc xdotool ffmpeg; do
         if command -v "$cmd" &>/dev/null; then
             echo "  ✅ $cmd"
         else
