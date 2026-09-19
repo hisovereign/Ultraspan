@@ -298,6 +298,9 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             outline: 2px solid @theme_selected_bg_color;
             outline-offset: -2px;
         }
+        .cat-walker {
+            font-size: 20px;
+        }
         """)
         gtk['Gtk'].StyleContext.add_provider_for_display(
             gtk['Gdk'].Display.get_default(),
@@ -511,6 +514,44 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         except AttributeError:
             pass
 
+    def _make_cat_widget(self, gtk):
+        container = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 0)
+        container.set_size_request(160, -1)
+        container.set_valign(gtk['Gtk'].Align.CENTER)
+        container.set_opacity(0)
+        self.cat_label = gtk['Gtk'].Label.new("🐈")
+        self.cat_label.set_halign(gtk['Gtk'].Align.START)
+        self.cat_label.set_valign(gtk['Gtk'].Align.CENTER)
+        self.cat_label.add_css_class("cat-walker")
+        container.append(self.cat_label)
+        self.cat_container = container
+        self._cat_pos = 0
+        self._cat_timeout = None
+        return container
+
+    def _start_cat(self):
+        self.cat_container.set_opacity(1)
+        self._cat_pos = 136
+        self.cat_label.set_margin_start(136)
+        if self._cat_timeout is None:
+            self._cat_timeout = GTK['GLib'].timeout_add(40, self._tick_cat)
+
+    def _tick_cat(self):
+        if self._cat_timeout is None:
+            return False
+        self._cat_pos -= 2
+        if self._cat_pos < 0:
+            # Cat walked off the left edge — respawn at the right.
+            self._cat_pos = 136
+        self.cat_label.set_margin_start(self._cat_pos)
+        return True
+
+    def _stop_cat(self):
+        if self._cat_timeout is not None:
+            GTK['GLib'].source_remove(self._cat_timeout)
+            self._cat_timeout = None
+        self.cat_container.set_opacity(0)
+
     def _build_monitor_group(self, gtk, page) -> None:
         group = gtk['Adw'].PreferencesGroup.new()
         group.set_title("  Monitors")
@@ -545,7 +586,13 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.apply_btn = gtk['Gtk'].Button.new_with_label("Apply")
         self.apply_btn.add_css_class("suggested-action")
         self.apply_btn.connect('clicked', self._on_apply_clicked)
-        right.append(self.apply_btn)
+
+        # Cat row: 80px cat slot + Apply, side by side
+        cat_row = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 6)
+        cat_row.set_halign(gtk['Gtk'].Align.END)
+        cat_row.append(self._make_cat_widget(gtk))
+        cat_row.append(self.apply_btn)
+        right.append(cat_row)
         hbox.append(right)
         group.add(hbox)
         self._populate_monitor_list()
@@ -1022,10 +1069,8 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             if not path:
                 return
             if is_video_path(path):
-                # Full-span video. Doesn't touch the underlying wallpaper.
                 cmd_list.append(["set-video", path])
             else:
-                # Image: kill any running video, then set the image.
                 cmd_list.append(["stop-video"])
                 cmd_list.append(["set", path, config_mode])
 
@@ -1039,7 +1084,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                     slot_paths.append(p if p else "none")
             if all(p == "none" for p in slot_paths):
                 return
-            # set-media stops any running video and rebuilds the mixed canvas.
             cmd_list.append(["set-media"] + slot_paths)
 
         elif mode == 'video':
@@ -1057,13 +1101,23 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         if not cmd_list:
             return
 
+        # Start the cat walker + lock the button while work happens
+        self._start_cat()
+        btn.set_sensitive(False)
+
         def run() -> None:
             for cmd in cmd_list:
                 self._run_ultraspan(cmd)
+            GTK['GLib'].idle_add(self._on_apply_finished)
 
         threading.Thread(target=run, daemon=True).start()
-        btn.set_label("Applied!")
-        GTK['GLib'].timeout_add(1500, lambda: btn.set_label("Apply"))
+
+    def _on_apply_finished(self) -> bool:
+        self._stop_cat()
+        self.apply_btn.set_sensitive(True)
+        self.apply_btn.set_label("Applied!")
+        GTK['GLib'].timeout_add(1500, lambda: self.apply_btn.set_label("Apply"))
+        return False
 
     # ------------------------------------------------------------------
     # Populate grid
@@ -1281,24 +1335,39 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             GTK['GLib'].timeout_add(2500, self._update_service_status)
 
     def _on_mode_changed(self, row, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
         val = row.get_model().get_string(row.get_selected())
         self.config.set('mode', val)
-        self._run_ultraspan_async(["mode", val])
+        # No command — applies on the next Apply click.
 
     def _on_bg_type_changed(self, row, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
         val = row.get_model().get_string(row.get_selected())
         self.config.set('bg_type', val)
-        self._run_ultraspan_async(["bg-type", val])
+        # No command — applies on the next Apply click.
 
     def _on_blur_changed(self, scale, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
+        if getattr(self, '_blur_timeout', None):
+            GTK['GLib'].source_remove(self._blur_timeout)
+        self._blur_timeout = GTK['GLib'].timeout_add(500, self._commit_blur, scale)
+
+    def _commit_blur(self, scale):
+        self._blur_timeout = None
         val = int(scale.get_value())
         self.config.set('blur', str(val))
-        self._run_ultraspan_async(["blur", str(val)])
+        # No command — the new value applies on the next Apply click.
+        return False
 
     def _on_color_changed(self, btn, *args) -> None:
+        if getattr(self, '_updating_widgets', False):
+            return
         color = btn.props.rgba.to_string()
         self.config.set('color', color)
-        self._run_ultraspan_async(["color", color])
+        # No command — applies on the next Apply click.
 
     def _on_fullscreen_grace_changed(self, spin, *args) -> None:
         val = int(spin.get_value())
@@ -1477,7 +1546,11 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         try:
             result = subprocess.run(
                 [SCRIPT_PATH] + args,
-                capture_output=True, text=True, timeout=120, check=False
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+                stdin=subprocess.DEVNULL,
             )
             return result.stdout.strip(), result.stderr.strip(), result.returncode
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
@@ -1564,8 +1637,10 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             rgba.parse(color_str if color_str else '#000000')
             self.color_btn.props.rgba = rgba
 
-            self.folder_button.set_label(self.config.get('wallpaper_folder'))
-            self._populate_wallpaper_list_async()
+            new_folder = self.config.get('wallpaper_folder')
+            if self.folder_button.get_label() != new_folder:
+                self.folder_button.set_label(new_folder)
+                self._populate_wallpaper_list_async()
 
             self.random_spin.set_value(self.config.get_int('random_interval'))
             new_mr = self.config.get_bool('multi_random')
