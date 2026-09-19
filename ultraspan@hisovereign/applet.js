@@ -6,7 +6,6 @@ const St = imports.gi.St;
 const Main = imports.ui.main;
 const Gettext = imports.gettext;
 const Tooltips = imports.ui.tooltips;
-const Gtk = imports.gi.Gtk;
 
 let UUID = "ultraspan@hisovereign";
 
@@ -38,11 +37,7 @@ class UltraspanApplet extends Applet.IconApplet {
         this._assert(!this._destroyed, "Applet already destroyed");
 
 
-        let iconName = "preferences-desktop-wallpaper-symbolic";
-        if (!Gtk.IconTheme.get_default().has_icon(iconName)) {
-            iconName = "image-x-generic-symbolic";
-        }
-        this.set_applet_icon_symbolic_name(iconName);
+        this.set_applet_icon_symbolic_name("preferences-desktop-wallpaper-symbolic");
         this.set_applet_tooltip(_("Ultraspan"));
         // Accessibility: name the applet icon
         this.actor.accessible_name = _("Ultraspan wallpaper manager");
