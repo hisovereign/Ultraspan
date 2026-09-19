@@ -4,7 +4,7 @@ set -u
 # ============================================
 # Ultraspan - Ultimate Multi-Monitor Wallpaper Utility
 # ============================================
-# Version 6.0.0
+# Version 6.0.1
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -36,7 +36,7 @@ CACHE_DIR="${HOME}/.cache/ultraspan"
 STATE_FILE="${CONFIG_DIR}/state"
 RANDOM_FILE="${CONFIG_DIR}/random"
 REFRESH_FILE="${CONFIG_DIR}/refresh"
-LOCK_FILE="/tmp/ultraspan.lock"
+LOCK_FILE="/run/user/${UID}/ultraspan.lock"
 FULLSCREEN_FILE="${CONFIG_DIR}/fullscreen"
 LAYOUT_MONITOR_PIDFILE="${CONFIG_DIR}/layout_monitor.pid"
 LOG_FILE="${CACHE_DIR}/ultraspan.log"
@@ -980,16 +980,40 @@ set_video_on_wallpaper() {
 }
 
 stop_video_wallpaper() {
+    local killed=false
+
+    # Kill the tracked pid if we have one
     if [[ -f "$VIDEO_PID_FILE" ]]; then
         local pid
         pid="$(cat "$VIDEO_PID_FILE")"
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
-            pkill -P "$pid" 2>/dev/null || true
+            killed=true
         fi
         rm -f "$VIDEO_PID_FILE"
+    fi
+
+    # Sweep any orphaned lightning-bug processes that survived.
+    # This catches manually-launched daemons and stale instances
+    # left behind by crashes.
+    if pgrep -x lightning-bug >/dev/null 2>&1; then
+        pkill -x lightning-bug 2>/dev/null || true
+        killed=true
+    fi
+
+    # Wait for them to actually exit (up to 2s)
+    if [[ "$killed" == "true" ]]; then
+        for _ in {1..20}; do
+            pgrep -x lightning-bug >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+        # Escalate if still alive
+        if pgrep -x lightning-bug >/dev/null 2>&1; then
+            pkill -9 -x lightning-bug 2>/dev/null || true
+        fi
         log "INFO" "Video wallpaper stopped."
     fi
+
     return 0
 }
 
@@ -1259,8 +1283,28 @@ refresh_wallpaper() {
 is_fullscreen_active() {
     local active_window
     active_window="$(xprop -root _NET_ACTIVE_WINDOW 2>/dev/null | awk '{print $5}')"
-    [[ -n "$active_window" ]] || return 1
-    xprop -id "$active_window" _NET_WM_STATE 2>/dev/null | grep -q "_NET_WM_STATE_FULLSCREEN"
+    [[ -n "$active_window" && "$active_window" != "0x0" ]] || return 1
+
+    local wtype wstate wclass
+    wtype="$(xprop -id "$active_window" _NET_WM_WINDOW_TYPE 2>/dev/null)"
+    wstate="$(xprop -id "$active_window" _NET_WM_STATE 2>/dev/null)"
+    wclass="$(xprop -id "$active_window" WM_CLASS 2>/dev/null)"
+
+    # Skip our own daemon's windows by class — reliable even when
+    # the WM strips SKIP_TASKBAR or before DESKTOP type is applied.
+    if [[ "$wclass" == *lightning-bug* ]]; then
+        return 1
+    fi
+
+    if [[ "$wtype" == *DESKTOP* ]]; then
+        return 1
+    fi
+
+    if [[ "$wstate" == *SKIP_TASKBAR* ]] || [[ "$wstate" == *SKIP_PAGER* ]]; then
+        return 1
+    fi
+
+    [[ "$wstate" == *"_NET_WM_STATE_FULLSCREEN"* ]]
 }
 
 # ----------------------------------------------------------------------
@@ -1424,23 +1468,23 @@ start_refresh_mode() {
         exit 0
     }
 
-    do_refresh &
+    do_refresh >/dev/null 2>&1 &
     refresh_pid=$!
     echo $refresh_pid >> "$REFRESH_FILE"
     log "INFO" "Periodic refresh started (PID $refresh_pid)"
 
     if [[ "${CONFIG[fullscreen_pause]}" == "true" ]]; then
-        monitor_fullscreen &
+        monitor_fullscreen </dev/null >/dev/null 2>&1 &
         echo $! > "$FULLSCREEN_FILE"
     fi
 
     if [[ ! -f "$LAYOUT_MONITOR_PIDFILE" ]] || ! kill -0 "$(cat "$LAYOUT_MONITOR_PIDFILE")" 2>/dev/null; then
-        monitor_layout &
+        monitor_layout >/dev/null 2>&1 &
         echo $! > "$LAYOUT_MONITOR_PIDFILE"
     fi
 
     if [[ "${CONFIG[per_workspace]}" == "true" ]]; then
-        monitor_workspace &
+        monitor_workspace >/dev/null 2>&1 &
         echo $! >> "$LAYOUT_MONITOR_PIDFILE"
     fi
     return 0
@@ -1498,7 +1542,7 @@ _ensure_fullscreen_monitor() {
     fi
 
     log "INFO" "Starting fullscreen monitor"
-    monitor_fullscreen &
+    monitor_fullscreen </dev/null >/dev/null 2>&1 &
     echo $! > "$FULLSCREEN_FILE"
     return 0
 }
@@ -1679,7 +1723,7 @@ start_daemon() {
                 done
                 log "ERROR" "Daemon idle loop exceeded limit. Exiting."
                 exit 0
-            ) &
+            ) >/dev/null 2>&1 &
             disown
             log "INFO" "Daemon sent to background."
             exit 0
