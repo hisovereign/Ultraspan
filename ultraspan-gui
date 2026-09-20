@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.4.1
+# Version 1.5.0
 # ============================================
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ DAEMON_PID_FILE = os.path.join('/run/user', str(os.getuid()), 'ultraspan', 'daem
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.gif')
 ALL_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+THUMB_W, THUMB_H = 128, 72 
 
 
 # ----------------------------------------------------------------------
@@ -169,13 +170,14 @@ def get_thumbnail_path(media_path: str, size: int = 120) -> str:
     return os.path.join(THUMBNAIL_CACHE, f"{hash_name}.png")
 
 
-def generate_video_thumbnail(video_path: str, thumb_path: str, size: int = 134) -> bool:
+def generate_video_thumbnail(video_path: str, thumb_path: str,
+                             w: int = THUMB_W, h: int = THUMB_H) -> bool:
     try:
         result = subprocess.run(
             ['ffmpeg', '-y', '-loglevel', 'error',
              '-ss', '1', '-i', video_path,
              '-vframes', '1',
-             '-vf', f'scale={size}:{size}:force_original_aspect_ratio=decrease',
+             '-vf', f'scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}',
              thumb_path],
             capture_output=True, timeout=20, check=False
         )
@@ -183,22 +185,46 @@ def generate_video_thumbnail(video_path: str, thumb_path: str, size: int = 134) 
     except (OSError, subprocess.TimeoutExpired):
         return False
 
+def _cover_crop_pixbuf(gtk, src_pixbuf, target_w, target_h):
+    """Scale + center-crop a pixbuf to exactly fill target_w x target_h."""
+    src_w = src_pixbuf.get_width()
+    src_h = src_pixbuf.get_height()
+
+    if src_w == 0 or src_h == 0:
+        return src_pixbuf
+
+    src_ratio = src_w / src_h
+    target_ratio = target_w / target_h
+
+    if src_ratio > target_ratio:
+        # Source is wider — fit height, crop sides.
+        new_h = target_h
+        new_w = max(1, int(round(src_w * (target_h / src_h))))
+    else:
+        # Source is taller — fit width, crop top/bottom.
+        new_w = target_w
+        new_h = max(1, int(round(src_h * (target_w / src_w))))
+
+    scaled = src_pixbuf.scale_simple(new_w, new_h, gtk['GdkPixbuf'].InterpType.BILINEAR)
+    offset_x = (new_w - target_w) // 2
+    offset_y = (new_h - target_h) // 2
+    return scaled.new_subpixbuf(offset_x, offset_y, target_w, target_h)
 
 def build_media_pixbuf(gtk, path: str):
-    thumb_path = get_thumbnail_path(path, size=134)
+    thumb_path = get_thumbnail_path(path, size=THUMB_W)
     pixbuf = None
 
-    # 1. Try the cache
+    # 1. Try the cache.
     if os.path.exists(thumb_path):
         try:
             pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
         except gtk['GLib'].Error:
             pixbuf = None
 
-    # 2. Generate fresh
+    # 2. Generate fresh.
     if pixbuf is None:
         if is_video_path(path):
-            if generate_video_thumbnail(path, thumb_path, size=134):
+            if generate_video_thumbnail(path, thumb_path):
                 try:
                     pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file(thumb_path)
                 except gtk['GLib'].Error:
@@ -207,7 +233,11 @@ def build_media_pixbuf(gtk, path: str):
                 print(f"[thumb] ffmpeg failed: {path}", file=sys.stderr)
         else:
             try:
-                pixbuf = gtk['GdkPixbuf'].Pixbuf.new_from_file_at_scale(path, 134, 134, True)
+                # Load at a slightly larger size so the crop has quality to work with.
+                raw = gtk['GdkPixbuf'].Pixbuf.new_from_file_at_scale(
+                    path, THUMB_W * 2, THUMB_H * 2, True
+                )
+                pixbuf = _cover_crop_pixbuf(gtk, raw, THUMB_W, THUMB_H)
                 try:
                     pixbuf.savev(thumb_path, 'png', [], [])
                 except (gtk['GLib'].Error, OSError):
@@ -216,15 +246,14 @@ def build_media_pixbuf(gtk, path: str):
                 print(f"[thumb] decode failed: {path}: {type(e).__name__}: {e}", file=sys.stderr)
                 pixbuf = None
 
-    # 3. Placeholder so nothing disappears
+    # 3. Placeholder so nothing disappears.
     if pixbuf is None:
         print(f"[thumb] using placeholder: {path}", file=sys.stderr)
         pixbuf = gtk['GdkPixbuf'].Pixbuf.new(
-            gtk['GdkPixbuf'].Colorspace.RGB, False, 8, 134, 134
+            gtk['GdkPixbuf'].Colorspace.RGB, False, 8, THUMB_W, THUMB_H
         )
         pixbuf.fill(0x3a3a3aff)
     return pixbuf
-
 
 def create_spin_row(title, subtitle, min_val, max_val, step, initial, on_changed):
     gtk = GTK
@@ -248,7 +277,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         super().__init__(title="Ultraspan Settings")
         self.app = app
         self.config = UltraspanConfig()
-        self.set_default_size(650, 900)
+        self.set_default_size(427, 700)
 
         self.monitor_count = 0
         self._updating_widgets = False
@@ -256,7 +285,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
 
         # Per-mode selection state.
         self.wallpaper_selection = None          # FlowBoxChild or None
-        self.per_monitor_slots = []              # [FlowBoxChild|None] * monitor_count
+        self.per_monitor_selections = []         # [FlowBoxChild] with .assigned_monitor
         self.video_selections = []               # [FlowBoxChild] with .assigned_monitor
 
         self._setup_styles()
@@ -406,9 +435,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             return 'per_monitor'
         return 'wallpaper'
 
-    def _get_current_max_allowed(self) -> int:
-        return 1 if self.mode_wallpaper_btn.get_active() else self.monitor_count
-
     def _is_daemon_running(self) -> bool:
         if not os.path.exists(DAEMON_PID_FILE):
             return False
@@ -490,7 +516,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         scrolled.set_child(self.wallpaper_flowbox)
 
         # Three exclusive toggles: Wallpaper | Per-Monitor | Video
-        mode_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 0)
+        mode_box = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 1)
         mode_box.set_halign(gtk['Gtk'].Align.END)
         mode_box.set_valign(gtk['Gtk'].Align.CENTER)
 
@@ -950,12 +976,11 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
             if self.wallpaper_selection is not None:
                 self.wallpaper_selection.add_css_class('selected')
         elif mode == 'per_monitor':
-            for i, slot_child in enumerate(self.per_monitor_slots):
-                if slot_child is not None:
-                    slot_child.add_css_class('selected')
-                    if hasattr(slot_child, 'badge_label'):
-                        slot_child.badge_label.set_text(str(i + 1))
-                        slot_child.badge_label.set_visible(True)
+            for c in self.per_monitor_selections:
+                c.add_css_class('selected')
+                if hasattr(c, 'badge_label'):
+                    c.badge_label.set_text(str(c.assigned_monitor + 1))
+                    c.badge_label.set_visible(True)
         elif mode == 'video':
             for c in self.video_selections:
                 c.add_css_class('selected')
@@ -971,7 +996,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         if mode == 'wallpaper':
             self._handle_single_click(child)
         elif mode == 'per_monitor':
-            self._handle_slot_click(child, self.per_monitor_slots)
+            self._handle_per_monitor_click(child)
         elif mode == 'video':
             self._handle_video_click(child)
 
@@ -985,26 +1010,29 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.wallpaper_selection = child
         child.add_css_class('selected')
 
-    def _handle_slot_click(self, child, slots) -> None:
-        # Deselect if already in a slot.
-        for i, c in enumerate(slots):
-            if c is child:
-                slots[i] = None
-                child.remove_css_class('selected')
-                if hasattr(child, 'badge_label'):
-                    child.badge_label.set_visible(False)
-                    child.badge_label.set_text("")
-                return
-        try:
-            slot = slots.index(None)
-        except ValueError:
+    def _handle_per_monitor_click(self, child) -> None:
+        # Deselect if already selected.
+        if child in self.per_monitor_selections:
+            self.per_monitor_selections.remove(child)
+            child.remove_css_class('selected')
+            if hasattr(child, 'badge_label'):
+                child.badge_label.set_visible(False)
+                child.badge_label.set_text("")
             return
-        if sum(1 for s in slots if s is not None) >= self._get_current_max_allowed():
+            
+        if len(self.per_monitor_selections) >= self.monitor_count:
             return
-        slots[slot] = child
+            
+        used = {c.assigned_monitor for c in self.per_monitor_selections}
+        free = next((i for i in range(self.monitor_count) if i not in used), None)
+        if free is None:
+            return
+            
+        child.assigned_monitor = free
+        self.per_monitor_selections.append(child)
         child.add_css_class('selected')
         if hasattr(child, 'badge_label'):
-            child.badge_label.set_text(str(slot + 1))
+            child.badge_label.set_text(str(free + 1))
             child.badge_label.set_visible(True)
 
     def _handle_video_click(self, child) -> None:
@@ -1031,12 +1059,13 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
 
     def _handle_badge_click(self, gesture, n_press, x, y, child) -> None:
         mode = self._current_mode()
-        if mode == 'video':
-            used = {c.assigned_monitor for c in self.video_selections if c is not child}
+        if mode == 'video' or mode == 'per_monitor':
+            selections = self.video_selections if mode == 'video' else self.per_monitor_selections
+            used = {c.assigned_monitor for c in selections if c is not child}
             if self.monitor_count == 0:
                 return
             nxt = (child.assigned_monitor + 1) % self.monitor_count
-            # Skip monitors taken by other selected videos.
+            # Skip monitors taken by other selected items.
             for _ in range(self.monitor_count):
                 if nxt not in used:
                     break
@@ -1075,13 +1104,14 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 cmd_list.append(["set", path, config_mode])
 
         elif mode == 'per_monitor':
-            slot_paths = []
-            for child in self.per_monitor_slots:
-                if child is None:
-                    slot_paths.append("none")
-                else:
-                    p = getattr(child, 'path', None)
-                    slot_paths.append(p if p else "none")
+            if not self.per_monitor_selections:
+                return
+            # Build a list of "none" for every monitor, then fill in the assigned ones.
+            slot_paths = ["none"] * self.monitor_count
+            for c in self.per_monitor_selections:
+                p = getattr(c, 'path', None)
+                if p:
+                    slot_paths[c.assigned_monitor] = p
             if all(p == "none" for p in slot_paths):
                 return
             cmd_list.append(["set-media"] + slot_paths)
@@ -1141,7 +1171,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
 
         # Clearing the grid invalidates any selection state.
         self.wallpaper_selection = None
-        self.per_monitor_slots = [None] * self.monitor_count
+        self.per_monitor_selections = []
         self.video_selections = []
 
         if not files:
@@ -1170,9 +1200,10 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         texture = gtk['Gdk'].Texture.new_for_pixbuf(pixbuf)
         picture = gtk['Gtk'].Picture.new_for_paintable(texture)
         picture.set_can_shrink(True)
-        picture.set_size_request(134, 134)
+        picture.set_size_request(THUMB_W, THUMB_H)
+        picture.set_content_fit(gtk['Gtk'].ContentFit.FILL)
         picture.set_halign(gtk['Gtk'].Align.CENTER)
-        picture.set_valign(gtk['Gtk'].Align.START)
+        picture.set_valign(gtk['Gtk'].Align.FILL)
 
         badge = gtk['Gtk'].Label.new("")
         badge.set_halign(gtk['Gtk'].Align.START)
@@ -1183,7 +1214,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         badge.set_visible(False)
 
         overlay = gtk['Gtk'].Overlay.new()
-        overlay.set_valign(gtk['Gtk'].Align.START)
+        overlay.set_valign(gtk['Gtk'].Align.FILL)
         overlay.set_halign(gtk['Gtk'].Align.CENTER)
         overlay.set_child(picture)
         overlay.add_overlay(badge)
@@ -1263,7 +1294,9 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         except (OSError, subprocess.TimeoutExpired):
             monitors = []
         self.monitor_count = len(monitors)
-        self.per_monitor_slots = [None] * self.monitor_count
+        # Clean up selections that reference disconnected monitors
+        self.per_monitor_selections = [c for c in self.per_monitor_selections if c.assigned_monitor < self.monitor_count]
+        self.video_selections = [c for c in self.video_selections if c.assigned_monitor < self.monitor_count]
         if not monitors:
             self.monitor_list_box.append(gtk['Gtk'].Label.new("No monitors detected"))
             return
