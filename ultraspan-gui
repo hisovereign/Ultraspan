@@ -199,11 +199,11 @@ def _cover_crop_pixbuf(gtk, src_pixbuf, target_w, target_h):
     if src_ratio > target_ratio:
         # Source is wider — fit height, crop sides.
         new_h = target_h
-        new_w = max(1, int(round(src_w * (target_h / src_h))))
+        new_w = max(1, round(src_w * (target_h / src_h)))
     else:
         # Source is taller — fit width, crop top/bottom.
         new_w = target_w
-        new_h = max(1, int(round(src_h * (target_w / src_w))))
+        new_h = max(1, round(src_h * (target_w / src_w)))
 
     scaled = src_pixbuf.scale_simple(new_w, new_h, gtk['GdkPixbuf'].InterpType.BILINEAR)
     offset_x = (new_w - target_w) // 2
