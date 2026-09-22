@@ -4,7 +4,7 @@ set -u
 # ============================================
 # Ultraspan - Ultimate Multi-Monitor Wallpaper Utility
 # ============================================
-# Version 6.0.1
+# Version 6.1.0
 # ============================================
 
 # ----------------------------------------------------------------------
@@ -29,7 +29,7 @@ CONFIG[video_slice_fps]=30
 CONFIG[video_slice_crf]=18
 CONFIG[fullscreen_grace_seconds]=5
 
-VERSION="6.0.0"
+VERSION="6.1.0"
 CONFIG_DIR="${HOME}/.config/ultraspan"
 CONFIG_FILE="${CONFIG_DIR}/config"
 CACHE_DIR="${HOME}/.cache/ultraspan"
@@ -84,6 +84,63 @@ _find_video_daemon() {
         return 0
     fi
 
+    return 1
+}
+
+_launch_daemon_hardened() {
+    local daemon="$1"; shift
+
+    # Clear any stale PID file so we don't pick up an old daemon's PID.
+    rm -f "/run/user/$UID/ultraspan/video-daemon.pid"
+
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        "$daemon" "$@" >/dev/null 2>&1 &
+        echo $!
+        return
+    fi
+
+    systemd-run --user --collect --quiet --no-block \
+        --unit="lightning-bug-$$-$(date +%s%N)" \
+        --property=Type=exec \
+        --property=NoNewPrivileges=yes \
+        --property=PrivateTmp=yes \
+        --property=ProtectSystem=strict \
+        --property=ProtectHome=read-only \
+        --property=ReadWritePaths="$HOME/.config/ultraspan" \
+        --property=ReadWritePaths="$HOME/.cache/ultraspan" \
+        --property=ReadWritePaths="$HOME/.cache/mpv" \
+        --property=ReadWritePaths="/run/user/$UID/ultraspan" \
+        --property=RestrictAddressFamilies="AF_UNIX" \
+        --property=RestrictNamespaces=yes \
+        --property=RestrictRealtime=yes \
+        --property=LockPersonality=yes \
+        --property=SystemCallArchitectures=native \
+        --property=SystemCallFilter="@system-service" \
+        --property=DeviceAllow="/dev/dri/card0 rw" \
+        --property=DeviceAllow="/dev/dri/renderD128 rw" \
+        --property=DeviceAllow="/dev/shm rw" \
+        --property=BindReadOnlyPaths="/tmp/.X11-unix" \
+        --setenv=DISPLAY="$DISPLAY" \
+        --setenv=XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        "$daemon" "$@"
+
+    # Wait for the daemon to write its own PID file, then return that PID.
+    local daemon_pid_file="/run/user/$UID/ultraspan/video-daemon.pid"
+    local deadline=$((SECONDS + 10))
+    while (( SECONDS < deadline )); do
+        if [[ -f "$daemon_pid_file" ]]; then
+            local dpid
+            dpid="$(cat "$daemon_pid_file" 2>/dev/null)"
+            if [[ -n "$dpid" ]] && kill -0 "$dpid" 2>/dev/null; then
+                echo "$dpid"
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+
+    echo ""
+    log "WARN" "Daemon did not write PID file within 10s; check journalctl --user -u 'lightning-bug-*'"
     return 1
 }
 
@@ -154,11 +211,18 @@ log() {
     local msg="$*"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Always append to log file for non-DEBUG levels, or anything when DEBUG=true.
+    if [[ "$DEBUG" == "true" ]] || [[ "$level" == "INFO" ]] || [[ "$level" == "WARN" ]] || [[ "$level" == "ERROR" ]]; then
+        printf "[%s] %s: %s\n" "$timestamp" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null
+    fi
+
+    # Mirror errors to stderr so they're visible in the terminal too.
     if [[ "$level" == "ERROR" ]]; then
         printf "[%s] %s: %s\n" "$timestamp" "$level" "$msg" >&2
-    elif [[ "$DEBUG" == "true" ]] || [[ "$level" == "INFO" ]] || [[ "$level" == "WARN" ]]; then
-        printf ... >> "$LOG_FILE"
     fi
+
+    # Optional terminal echo when VERBOSE=true (skips errors, already shown).
     if [[ "$VERBOSE" == "true" ]] && [[ "$level" != "ERROR" ]]; then
         printf "[%s] %s\n" "$timestamp" "$msg"
     fi
@@ -346,8 +410,10 @@ get_monitor_info() {
 # Workspace helpers
 # ----------------------------------------------------------------------
 get_current_workspace() {
-    assert_command_available xdotool || { echo 0; return 0; }
-    xdotool get_desktop 2>/dev/null || echo 0
+    local ws
+    ws="$(xprop -root _NET_CURRENT_DESKTOP 2>/dev/null | awk '{print $3}')"
+    [[ "$ws" =~ ^[0-9]+$ ]] || ws=0
+    echo "$ws"
 }
 
 get_state_file() {
@@ -357,7 +423,9 @@ get_state_file() {
 }
 
 get_total_span() {
-    get_monitor_info || { log "ERROR" "Failed to get monitor info"; return 1; }
+    if [[ -z "${MONITOR_COUNT:-}" ]] || [[ "${MONITOR_COUNT:-0}" -eq 0 ]]; then
+        get_monitor_info || { log "ERROR" "Failed to get monitor info"; return 1; }
+    fi
     TOTAL_WIDTH=$((MAX_X - MIN_X))
     TOTAL_HEIGHT=$((MAX_Y - MIN_Y))
     log "INFO" "Span: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}"
@@ -788,7 +856,7 @@ set_per_monitor_wallpaper() {
 }
 
 # ----------------------------------------------------------------------
-# Video wallpaper (Rust daemon)
+# Video wallpaper (lightning-bug)
 # ----------------------------------------------------------------------
 set_video_wallpaper() {
     local video_file="$1"
@@ -801,10 +869,12 @@ set_video_wallpaper() {
     assert_file_exists "$daemon" || { log "ERROR" "Video daemon not found: $daemon"; return 1; }
 
     log "INFO" "Starting video daemon in split mode"
-    "$daemon" --split "$video_file" >/dev/null 2>&1 &
-    local pid=$!
-    disown
-
+    local pid
+    pid="$(_launch_daemon_hardened "$daemon" --split "$video_file")"
+    if [[ -z "$pid" ]]; then
+        log "ERROR" "Failed to start video daemon; see journalctl --user -u 'lightning-bug-*'"
+        return 1
+    fi
     echo "$pid" > "$VIDEO_PID_FILE"
     log "INFO" "Video wallpaper started (PID $pid)"
     return 0
@@ -828,9 +898,8 @@ set_video_per_monitor_wallpaper() {
     _ensure_fullscreen_monitor
 
     log "INFO" "Starting video daemon in per-monitor mode with $# video(s)"
-    "$daemon" --per-monitor "$@" >/dev/null 2>&1 &
-    local pid=$!
-    disown
+    local pid
+    pid="$(_launch_daemon_hardened "$daemon" --per-monitor "$@")"
 
     echo "$pid" > "$VIDEO_PID_FILE"
     log "INFO" "Per-monitor video wallpaper started (PID $pid)"
@@ -925,9 +994,8 @@ set_video_span_wallpaper() {
     assert_file_exists "$daemon" || { log "ERROR" "Daemon not found: $daemon"; return 1; }
 
     log "INFO" "Launching ${#files[@]} slice(s) via daemon --per-monitor"
-    "$daemon" --per-monitor "${files[@]}" >/dev/null 2>&1 &
-    local pid=$!
-    disown
+    local pid
+    pid="$(_launch_daemon_hardened "$daemon" --per-monitor "${files[@]}")"
     echo "$pid" > "$VIDEO_PID_FILE"
     log "INFO" "Spanning video (pre-cut) started (PID $pid)"
     return 0
@@ -971,11 +1039,55 @@ set_video_on_wallpaper() {
     _ensure_fullscreen_monitor
 
     log "INFO" "Starting daemon with --on ${on_args[*]}"
-    "$daemon" --on "${on_args[@]}" >/dev/null 2>&1 &
-    local pid=$!
-    disown
+    local pid
+    pid="$(_launch_daemon_hardened "$daemon" --on "${on_args[@]}")"
     echo "$pid" > "$VIDEO_PID_FILE"
     log "INFO" "Video(s) on selected monitors started (PID $pid)"
+    return 0
+}
+
+restart_video_wallpaper() {
+    if [[ ! -f "$VIDEO_PID_FILE" ]]; then
+        log "WARN" "No video wallpaper running."
+        return 1
+    fi
+    local pid
+    pid="$(cat "$VIDEO_PID_FILE")"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        log "WARN" "Video wallpaper not running (stale pid file)."
+        rm -f "$VIDEO_PID_FILE"
+        return 1
+    fi
+
+    local -a args=()
+    while IFS= read -r -d '' arg; do
+        args+=("$arg")
+    done < "/proc/$pid/cmdline"
+
+    if [[ ${#args[@]} -lt 2 ]]; then
+        log "ERROR" "Cannot read cmdline for PID $pid"
+        return 1
+    fi
+
+    local daemon="${args[0]}"
+    local daemon_args=("${args[@]:1}")
+
+    kill "$pid" 2>/dev/null || true
+    for _ in {1..20}; do
+        pgrep -x lightning-bug >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    pgrep -x lightning-bug >/dev/null 2>&1 && pkill -9 -x lightning-bug 2>/dev/null || true
+    rm -f "$VIDEO_PID_FILE"
+
+    local new_pid
+    new_pid="$(_launch_daemon_hardened "$daemon" "${daemon_args[@]}")"
+    if [[ -z "$new_pid" ]]; then
+        log "ERROR" "Failed to restart video daemon"
+        return 1
+    fi
+    echo "$new_pid" > "$VIDEO_PID_FILE"
+    log "INFO" "Video wallpaper restarted (PID $new_pid)"
     return 0
 }
 
@@ -1096,7 +1208,6 @@ _build_mixed_canvas() {
             continue
         fi
         local proc_file
-        local proc_file
         proc_file="$(process_image_for_area "$e" "${MONITOR_W[i]}" "${MONITOR_H[i]}" "$mode")" || {
             rm -f "$bg_canvas"
             return 1
@@ -1175,9 +1286,8 @@ set_mixed_media_wallpaper() {
 
     if [[ ${#video_indices[@]} -eq $MONITOR_COUNT ]]; then
         log "INFO" "All entries are videos; using daemon per-monitor mode"
-        "$daemon" --per-monitor "${video_paths[@]}" >/dev/null 2>&1 &
-        local pid=$!
-        disown
+        local pid
+        pid="$(_launch_daemon_hardened "$daemon" --per-monitor "${video_paths[@]}")"
         echo "$pid" > "$VIDEO_PID_FILE"
         log "INFO" "Per-monitor video wallpaper started (PID $pid)"
         return 0
@@ -1200,7 +1310,9 @@ set_mixed_media_wallpaper() {
     done
     local cache_key
     cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
-    local cache_file="${CACHE_DIR}/${cache_key}.jpg"
+    local canvas_dir="${CONFIG_DIR}/canvases"
+    mkdir -p "$canvas_dir"
+    local cache_file="${canvas_dir}/${cache_key}.jpg"
 
     if [[ ! -f "$cache_file" ]]; then
         log "INFO" "Building mixed-media static background..."
@@ -1210,6 +1322,19 @@ set_mixed_media_wallpaper() {
     fi
 
     _apply_per_monitor_backend "$cache_file" || return 1
+
+    # Record the *source entries* (not the baked canvas path) so refresh
+    # can rebuild the canvas when mode/blur/bg_type/color change later.
+    local entries_str
+    entries_str="$(printf "|%s" "${entries[@]}")"
+    entries_str="${entries_str:1}"
+    {
+        echo "canvas:${entries_str}"
+        echo "$mode"
+        echo "${CONFIG[bg_type]}"
+        echo "0"
+        date '+%Y-%m-%d %H:%M:%S'
+    } > "$STATE_FILE"
 
     if [[ ${#video_indices[@]} -eq 0 ]]; then
         log "INFO" "Static-only mixture; no videos to launch"
@@ -1222,9 +1347,8 @@ set_mixed_media_wallpaper() {
     done
 
     log "INFO" "Starting daemon with --on ${on_args[*]}"
-    "$daemon" --on "${on_args[@]}" >/dev/null 2>&1 &
-    local pid=$!
-    disown
+    local pid
+    pid="$(_launch_daemon_hardened "$daemon" --on "${on_args[@]}")"
     echo "$pid" > "$VIDEO_PID_FILE"
     log "INFO" "Mixed media wallpaper started (PID $pid)"
     return 0
@@ -1235,6 +1359,47 @@ set_mixed_media_wallpaper() {
 # ----------------------------------------------------------------------
 refresh_wallpaper() {
     assert_file_exists "$STATE_FILE" || { log "WARN" "No wallpaper state found"; return 1; }
+
+    # Special-case mixed-media canvases: rebuild from the saved source
+    # entries using current config, then reapply. This makes mode/blur/
+    # bg_type/color changes take effect on mixed-media workspaces.
+    local _head
+    _head="$(head -n1 "$STATE_FILE")"
+    if [[ "$_head" =~ ^canvas:(.*) ]]; then
+        local entries_str="${BASH_REMATCH[1]}"
+        local -a canvas_entries
+        IFS='|' read -ra canvas_entries <<< "$entries_str"
+
+        get_monitor_info >/dev/null 2>&1 || return 1
+        get_total_span >/dev/null 2>&1 || return 1
+
+        local mode_now="${CONFIG[mode]}"
+        local key_string="mixed|${CONFIG[bg_type]}|${CONFIG[blur]}|${CONFIG[color]}|${TOTAL_WIDTH}x${TOTAL_HEIGHT}|${mode_now}"
+        local e
+        for e in "${canvas_entries[@]}"; do
+            if [[ "$e" == "none" ]]; then
+                key_string+="|none"
+            else
+                local abs_e
+                abs_e="$(readlink -f "$e")"
+                key_string+="|${abs_e}|$(get_file_mtime "$abs_e")"
+            fi
+        done
+        local cache_key
+        cache_key="$(echo -n "$key_string" | md5sum | cut -d' ' -f1)"
+        local canvas_dir="${CONFIG_DIR}/canvases"
+        local canvas_file="${canvas_dir}/${cache_key}.jpg"
+
+        if [[ ! -f "$canvas_file" ]]; then
+            log "INFO" "Rebuilding mixed-media canvas (config changed or cache miss)"
+            mkdir -p "$canvas_dir"
+            _build_mixed_canvas "$canvas_file" "${canvas_entries[@]}" || return 1
+        fi
+
+        log "INFO" "Reapplying mixed-media canvas: $canvas_file"
+        _apply_per_monitor_backend "$canvas_file"
+        return $?
+    fi
 
     local recent_line mode saved_bg_type saved_blur_or_color
     recent_line="$(head -n1 "$STATE_FILE")"
@@ -1461,6 +1626,15 @@ start_refresh_mode() {
             ((iterations++))
             sleep $((interval * 60))
             [[ -f "$REFRESH_FILE" ]] || exit 0
+
+            # Periodic tick: don't clobber a live video with a stale
+            # static image. Other callers of refresh_wallpaper (workspace
+            # switch, layout change, manual) still run normally.
+            if [[ -f "$VIDEO_PID_FILE" ]] && kill -0 "$(cat "$VIDEO_PID_FILE")" 2>/dev/null; then
+                log "INFO" "Auto-refresh skipped: video wallpaper is active."
+                continue
+            fi
+
             log "INFO" "Auto-refreshing wallpaper"
             refresh_wallpaper
         done
@@ -1643,6 +1817,7 @@ monitor_layout() {
         current_layout="$(xrandr --current --listmonitors 2>/dev/null | md5sum | cut -d' ' -f1)"
         if [[ -n "$last_layout" ]] && [[ "$current_layout" != "$last_layout" ]]; then
             log "INFO" "Display layout changed – reapplying wallpaper"
+            get_monitor_info >/dev/null 2>&1
             refresh_wallpaper
         fi
         last_layout="$current_layout"
@@ -1659,7 +1834,8 @@ monitor_workspace() {
         ((iterations++))
         load_config
         local new_ws
-        new_ws="$(xdotool get_desktop 2>/dev/null || echo 0)"
+        new_ws="$(xprop -root _NET_CURRENT_DESKTOP 2>/dev/null | awk '{print $3}')"
+        [[ "$new_ws" =~ ^[0-9]+$ ]] || new_ws=0
         if [[ "$new_ws" != "$last_ws" ]]; then
             if [[ "${CONFIG[per_workspace]}" == "true" ]]; then
                 log "INFO" "Workspace changed to $new_ws"
@@ -1724,7 +1900,6 @@ start_daemon() {
                 log "ERROR" "Daemon idle loop exceeded limit. Exiting."
                 exit 0
             ) >/dev/null 2>&1 &
-            disown
             log "INFO" "Daemon sent to background."
             exit 0
             ;;
@@ -1808,7 +1983,7 @@ stop_daemon() {
 # ----------------------------------------------------------------------
 _diagnose_dependencies() {
     echo "Dependencies:"
-    for cmd in xrandr gsettings md5sum bc xdotool ffmpeg; do
+    for cmd in xrandr xprop gsettings md5sum bc ffmpeg systemd-run; do
         if command -v "$cmd" &>/dev/null; then
             echo "  ✅ $cmd"
         else
@@ -2059,7 +2234,7 @@ DAEMON CONFIG (~/.config/ultraspan/video-daemon.conf):
   scale=bilinear                Scaling filter
   start=0                       Seek to N seconds on load
   log_file=/tmp/mpv.log         Where mpv writes its log
-  tick_seconds=5                Drift-check interval (seconds)
+  tick_seconds=15                Drift-check interval (seconds)
 
 WORKSPACES (requires per_workspace = true in config):
   Use --workspace N to assign wallpapers to a specific workspace.
@@ -2209,11 +2384,7 @@ _handle_mode() {
     fi
     case "$1" in zoom|fit|center) ;; *) log "ERROR" "Invalid mode"; return 1 ;; esac
     update_config mode "$1" || return 1
-    if [[ -f "$STATE_FILE" ]]; then
-        local recent_image
-        recent_image="$(head -n1 "$STATE_FILE")"
-        [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$1"
-    fi
+    [[ -f "$STATE_FILE" ]] && refresh_wallpaper
     return 0
 }
 
@@ -2224,12 +2395,7 @@ _handle_bg_type() {
     fi
     case "$1" in blur|solid) ;; *) log "ERROR" "Invalid bg-type"; return 1 ;; esac
     update_config bg_type "$1" || return 1
-    if [[ -f "$STATE_FILE" ]]; then
-        local recent_image mode
-        recent_image="$(head -n1 "$STATE_FILE")"
-        mode="$(sed -n '2p' "$STATE_FILE" | head -n1)"
-        [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$mode"
-    fi
+    [[ -f "$STATE_FILE" ]] && refresh_wallpaper
     return 0
 }
 
@@ -2238,17 +2404,12 @@ _handle_blur() {
         echo "Blur: ${CONFIG[blur]}"
         return 0
     fi
-    if ! [[ "$1" =~ ^[0-9]+$ ]] || ! [[ "$1" -ge 0 ]] || ! [[ "$1" -le 100 ]]; then
+    if ! [[ "$1" =~ ^[0-9]+$ ]] || [[ "$1" -lt 0 ]] || [[ "$1" -gt 100 ]]; then
         log "ERROR" "Blur must be 0-100"
         return 1
     fi
     update_config blur "$1" || return 1
-    if [[ -f "$STATE_FILE" ]] && [[ "${CONFIG[bg_type]}" == "blur" ]]; then
-        local recent_image mode
-        recent_image="$(head -n1 "$STATE_FILE")"
-        mode="$(sed -n '2p' "$STATE_FILE" | head -n1)"
-        [[ -f "$recent_image" ]] && set_wallpaper "$recent_image" "$mode"
-    fi
+    [[ -f "$STATE_FILE" ]] && refresh_wallpaper
     return 0
 }
 
@@ -2354,6 +2515,7 @@ main() {
         pause-video) pause_video_wallpaper ;;
         resume-video) resume_video_wallpaper ;;
         stop-video) stop_video_wallpaper ;;
+        restart-video) restart_video_wallpaper ;;
         random) _handle_random "$@" ;;
         random-multi) _handle_random_multi "$@" ;;
         random-stop) stop_random_mode ;;
@@ -2392,7 +2554,7 @@ main() {
         daemon-stop) stop_daemon ;;
         data-wipe) data_wipe_ultraspan ;;
         set-config)
-            if [[ -z "$1" || -z "$2" ]]; then
+            if [[ $# -lt 2 ]]; then
                 log "ERROR" "Usage: set-config KEY VALUE"
                 ret=1
             else
