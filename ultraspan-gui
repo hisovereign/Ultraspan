@@ -13,7 +13,6 @@ import shutil
 import subprocess
 import sys
 import threading
-
 import gi
 
 gi.require_version('Gtk', '4.0')
@@ -87,6 +86,11 @@ class UltraspanConfig:
                 val = val.strip()
                 if key in self.values:
                     self.values[key] = val
+
+    def save(self) -> None:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            f.writelines(f"{key}={val}\n" for key, val in self.values.items())
 
     def get(self, key: str) -> str:
         if key not in self.defaults:
