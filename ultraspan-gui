@@ -2,7 +2,7 @@
 # ============================================
 # Ultraspan GTK GUI
 # ============================================
-# Version 1.5.0
+# Version 1.5.1
 # ============================================
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ SCRIPT_PATH = shutil.which('ultraspan') or os.path.expanduser('~/.local/bin/ultr
 DEFAULT_FOLDER = os.path.expanduser('~/Pictures/ultraspan')
 THUMBNAIL_CACHE = os.path.expanduser('~/.cache/ultraspan/thumbnails')
 DAEMON_PID_FILE = os.path.join('/run/user', str(os.getuid()), 'ultraspan', 'daemon.pid')
+VIDEO_PID_FILE = os.path.join(CONFIG_DIR, 'video.pid')
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.gif')
@@ -87,29 +88,28 @@ class UltraspanConfig:
                 if key in self.values:
                     self.values[key] = val
 
-    def save(self) -> None:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CONFIG_FILE, 'w') as f:
-            f.writelines(f"{key}={val}\n" for key, val in self.values.items())
-
     def get(self, key: str) -> str:
-        assert key in self.defaults, f"Unknown config key: {key}"
+        if key not in self.defaults:
+            raise KeyError(f"Unknown config key: {key}")
         return self.values.get(key, self.defaults.get(key, ''))
 
     def set(self, key: str, val: object) -> None:
-        assert key in self.defaults, f"Unknown config key: {key}"
+        if key not in self.defaults:
+            raise KeyError(f"Unknown config key: {key}")
         self.values[key] = str(val)
         self.save()
 
     def get_int(self, key: str) -> int:
-        assert key in self.defaults, f"Unknown config key: {key}"
+        if key not in self.defaults:
+            raise KeyError(f"Unknown config key: {key}")
         try:
             return int(self.get(key))
         except (ValueError, TypeError):
             return int(self.defaults.get(key, '0'))
 
     def get_bool(self, key: str) -> bool:
-        assert key in self.defaults, f"Unknown config key: {key}"
+        if key not in self.defaults:
+            raise KeyError(f"Unknown config key: {key}")
         return self.get(key).lower() in ('true', 'yes', '1', 'on')
 
 
@@ -287,6 +287,7 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.wallpaper_selection = None          # FlowBoxChild or None
         self.per_monitor_selections = []         # [FlowBoxChild] with .assigned_monitor
         self.video_selections = []               # [FlowBoxChild] with .assigned_monitor
+        self._video_paused = False
 
         self._setup_styles()
         self._build_pages()
@@ -344,80 +345,15 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         )
 
     def _on_restart_video_clicked(self, btn) -> None:
-        script_pid_file = os.path.expanduser('~/.config/ultraspan/video.pid')
-        daemon_pid_file = f'/run/user/{os.getuid()}/ultraspan/video-daemon.pid'
-
-        # Find the live daemon pid from either tracker.
-        pid = None
-        for pf in (script_pid_file, daemon_pid_file):
-            try:
-                with open(pf) as f:
-                    candidate = int(f.read().strip())
-                os.kill(candidate, 0)  # probe
-                pid = candidate
-                break
-            except (OSError, ValueError, FileNotFoundError):
-                continue
-
-        if pid is None:
-            self._flash_button(btn, "No video running")
-            return
-
-        # Read argv before killing.
-        try:
-            with open(f'/proc/{pid}/cmdline', 'rb') as f:
-                raw = f.read()
-            args = [a.decode(errors='replace') for a in raw.split(b'\0') if a]
-        except OSError:
-            self._flash_button(btn, "Cmdline unavailable")
-            return
-
-        if not args:
-            self._flash_button(btn, "Empty cmdline")
-            return
-
-        # Kill the daemon directly (SIGTERM), then remove stale pid files.
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-        for pf in (script_pid_file, daemon_pid_file):
-            try:
-                os.remove(pf)
-            except FileNotFoundError:
-                pass
-
-        def relaunch():
-            import time
-            # Wait for the old process to fully exit (up to 3s).
-            for _ in range(30):
-                try:
-                    os.kill(pid, 0)
-                    time.sleep(0.1)
-                except OSError:
-                    break
-
-            try:
-                proc = subprocess.Popen(
-                    args,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except OSError as e:
-                print(f"[restart] failed: {e}", file=sys.stderr)
-                return
-
-            # Give the daemon a moment to settle, then write the script's
-            # tracker so `ultraspan stop-video` keeps working.
-            time.sleep(0.6)
-            try:
-                with open(script_pid_file, 'w') as f:
-                    f.write(str(proc.pid))
-            except OSError as e:
-                print(f"[restart] pid-file write failed: {e}", file=sys.stderr)
-
-        threading.Thread(target=relaunch, daemon=True).start()
+        btn.set_sensitive(False)
+        self._video_paused = False
+        if hasattr(self, 'play_pause_btn'):
+            self.play_pause_btn.set_icon_name("media-playback-start-symbolic")
+            self.play_pause_btn.set_tooltip_text("Pause video wallpaper")
+        def run():
+            self._run_ultraspan(["restart-video"])
+            GTK['GLib'].idle_add(lambda: btn.set_sensitive(True))
+        threading.Thread(target=run, daemon=True).start()
         self._flash_button(btn, "Restarting…")
 
     def _flash_button(self, btn, text: str) -> None:
@@ -457,6 +393,40 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 detail = stderr.strip() if stderr.strip() else f"Exit code {returncode}"
                 self.status_label.set_text(f"Diagnostics failed:\n{detail}")
 
+    def _is_video_running(self) -> bool:
+        if not os.path.exists(VIDEO_PID_FILE):
+            return False
+        try:
+            with open(VIDEO_PID_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _on_play_pause_clicked(self, btn) -> None:
+        if not self._is_video_running():
+            return
+        # Track state locally — GUI doesn't query mpv directly.
+        if getattr(self, '_video_paused', False):
+            self._run_ultraspan_async(["resume-video"])
+            self._video_paused = False
+            btn.set_icon_name("media-playback-start-symbolic")
+            btn.set_tooltip_text("Pause video wallpaper")
+        else:
+            self._run_ultraspan_async(["pause-video"])
+            self._video_paused = True
+            btn.set_icon_name("media-playback-pause-symbolic")
+            btn.set_tooltip_text("Resume video wallpaper")
+
+    def _on_video_stop_clicked(self, btn) -> None:
+        if not self._is_video_running():
+            return
+        self._run_ultraspan_async(["stop-video"])
+        self._video_paused = False
+        self.play_pause_btn.set_icon_name("media-playback-start-symbolic")
+        self.play_pause_btn.set_tooltip_text("Pause video wallpaper")
+
     # ------------------------------------------------------------------
     # Page build
     # ------------------------------------------------------------------
@@ -483,7 +453,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
 
     def _build_folder_group(self, gtk, page) -> None:
         group = gtk['Adw'].PreferencesGroup.new()
-        group.set_title("  Wallpaper Folder")
         page.add(group)
         self.folder_button = gtk['Gtk'].Button.new_with_label(self.config.get('wallpaper_folder'))
         self.folder_button.set_halign(gtk['Gtk'].Align.FILL)
@@ -607,6 +576,16 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         folder_btn.connect('clicked', self._on_open_folder_clicked)
         icon_row.append(folder_btn)
 
+        self.play_pause_btn = gtk['Gtk'].Button.new_from_icon_name("media-playback-start-symbolic")
+        self.play_pause_btn.set_tooltip_text("Pause video wallpaper")
+        self.play_pause_btn.connect('clicked', self._on_play_pause_clicked)
+        icon_row.append(self.play_pause_btn)
+
+        self.video_stop_btn = gtk['Gtk'].Button.new_from_icon_name("media-playback-stop-symbolic")
+        self.video_stop_btn.set_tooltip_text("Stop video wallpaper")
+        self.video_stop_btn.connect('clicked', self._on_video_stop_clicked)
+        icon_row.append(self.video_stop_btn)
+
         right.append(icon_row)
 
         self.apply_btn = gtk['Gtk'].Button.new_with_label("Apply")
@@ -635,7 +614,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self._build_background_section(gtk, page)
         self._build_general_settings_section(gtk, page)
         self._build_video_settings_section(gtk, page)
-        self._build_playback_section(gtk, page)
         self._build_backend_section(gtk, page)
         self._build_auto_services_section(gtk, page)
         self._build_custom_background_section(gtk, page)
@@ -768,33 +746,6 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         restart_row.add_suffix(self.restart_btn)
         restart_row.set_activatable_widget(self.restart_btn)
         group.add(restart_row)
-
-    def _build_playback_section(self, gtk, page) -> None:
-        group = gtk['Adw'].PreferencesGroup.new()
-        group.set_title("  Playback")
-        group.set_description("  Control the currently-running video wallpaper")
-        page.add(group)
-
-        row = gtk['Gtk'].Box.new(gtk['Gtk'].Orientation.HORIZONTAL, 6)
-        row.set_margin_start(6)
-        row.set_margin_end(6)
-        row.set_margin_top(6)
-        row.set_margin_bottom(6)
-        row.set_homogeneous(True)
-
-        pause_btn = gtk['Gtk'].Button.new_with_label("Pause")
-        pause_btn.connect('clicked', lambda *a: self._run_ultraspan_async(["pause-video"]))
-        row.append(pause_btn)
-
-        resume_btn = gtk['Gtk'].Button.new_with_label("Resume")
-        resume_btn.connect('clicked', lambda *a: self._run_ultraspan_async(["resume-video"]))
-        row.append(resume_btn)
-
-        stop_btn = gtk['Gtk'].Button.new_with_label("Stop")
-        stop_btn.connect('clicked', lambda *a: self._run_ultraspan_async(["stop-video"]))
-        row.append(stop_btn)
-
-        group.add(row)
 
     def _build_backend_section(self, gtk, page) -> None:
         group = gtk['Adw'].PreferencesGroup.new()
@@ -1479,6 +1430,10 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
         self.random_daemon_switch.set_active(random_running)
         if hasattr(self, 'daemon_switch'):
             self.daemon_switch.set_active(daemon_running)
+        video_running = self._is_video_running()
+        if hasattr(self, 'play_pause_btn'):
+            self.play_pause_btn.set_sensitive(video_running)
+            self.video_stop_btn.set_sensitive(video_running)
 
     def _on_daemon_toggled(self, row, *args) -> None:
         if getattr(self, '_updating_widgets', False):
@@ -1712,6 +1667,12 @@ class UltraspanWindow(GTK['Adw'].PreferencesWindow):
                 self.daemon_monitor = f.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
                 self.daemon_monitor.connect('changed',
                     lambda *a: gtk['GLib'].idle_add(self._update_service_status))
+        video_dir = os.path.dirname(VIDEO_PID_FILE)
+        if os.path.exists(video_dir):
+            f = gtk['Gio'].File.new_for_path(video_dir)
+            self.video_monitor = f.monitor(gtk['Gio'].FileMonitorFlags.NONE, None)
+            self.video_monitor.connect('changed',
+                lambda *a: gtk['GLib'].idle_add(self._update_service_status))
 
 
 class UltraspanApp:
